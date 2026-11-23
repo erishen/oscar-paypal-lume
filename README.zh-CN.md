@@ -1,6 +1,5 @@
 # oscar-paypal-lume
 
-> 项目仓库：[oscar-paypal-lume](https://github.com/erishen/oscar-paypal-lume)
 > 本文件为中文文档；English version: [README.md](README.md)
 
 把 [django-oscar-paypal-store](https://github.com/erishen/django-oscar-paypal-store)（Django Oscar 4.1 + PayPal 演示）用

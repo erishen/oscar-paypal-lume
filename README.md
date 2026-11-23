@@ -1,6 +1,5 @@
 # oscar-paypal-lume
 
-> Repository: [oscar-paypal-lume](https://github.com/erishen/oscar-paypal-lume)
 > This file is the English version; 中文文档：[README.zh-CN.md](README.zh-CN.md)
 
 A rewrite of [django-oscar-paypal-store](https://github.com/erishen/django-oscar-paypal-store) (Django Oscar 4.1 + PayPal demo)
