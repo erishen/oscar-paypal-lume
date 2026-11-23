@@ -1,6 +1,6 @@
 # oscar-paypal-lume
 
-把 `../../personal-site/django-oscar-paypal-store`（Django Oscar 4.1 + PayPal 演示）用
+把 [django-oscar-paypal-store](https://github.com/erishen/django-oscar-paypal-store)（Django Oscar 4.1 + PayPal 演示）用
 **lume（host：agent-httpd）+ lume-core（语言）+ Vue3** 重写一遍。同一套业务口径：
 商品目录 / 搜索 / 购物篮 / 下单 / **PayPal Orders v2（CAPTURE）幂等支付**（sandbox）+
 **管理后台**（订单全量 / 真退款 / 商品上下架·库存 / 概览统计）。
@@ -93,7 +93,7 @@ static/media/       商品图（/static/media/<sku>.jpg，宿主静态 + Range�
     - 商品：上下架 PATCH、库存/价格调整、未上架商品不进目录
     - 退款契约：paid 无 capture → 400；假 capture 真调 PayPal → 5xx 不炸；已 refunded 重复退款 → 200 already（幂等）
     - 退款成功后回补库存 + 订单转 `refunded`（对齐原 dashboard 口径）
-- 2026-11-21（与 `django-oscar-paypal-store` 对齐补强）：
+- 2026-11-21（与 [django-oscar-paypal-store](https://github.com/erishen/django-oscar-paypal-store) 对齐补强）：
   - 服务端出站重试 3 次（网络错误；GET/OAuth 另含 429/5xx），对齐 `facade.py` 的 `Retry` + `_post`
   - 退款加稳定 `PayPal-Request-Id`，支持部分退款（`amount_cents`）/累计 `refunded_cents`，本地 key 去重
   - 货币改 `CURRENCY` 配置（默认 USD，`CURRENCY=GBP` 对齐 Oscar），库存只在全额退款后回补
@@ -142,7 +142,7 @@ make test-e2e-live-buyer    # buyer 账号登录支付（自动从 Chrome Keycha
 - buyer 账号来源：本机 Chrome 保存的 `sb-*@personal.example.com`（sandbox buyer）登录，密码经 `Chrome Safe Storage` 密钥解密。脚本优先选 personal 账号；可 `BUYER_EMAIL` / `BUYER_PASS` 手动覆盖。
 - 注意容器网络到 `api-m.sandbox.paypal.com` 可能 TLS 失败（DNS 被劫持到 `zscloudsafe.com`）；遇到 503 时可在宿主机 `PORT=20102 <lume> app.lume` 起服务并 `E2E_BASE_URL=http://127.0.0.1:20102 make test-e2e-live-buyer`。
 - sandbox 只模拟资金流，不产生真实扣款；但会在你的 PayPal sandbox 商户后台留下真实的交易与退款记录。
-- 商户凭据仍从 `.secrets.json` 读（`paypal_client_id` / `paypal_client_secret` / `paypal_mode`），与 `django-oscar-paypal-store/.env` 里的三项完全一致。
+- 商户凭据仍从 `.secrets.json` 读（`paypal_client_id` / `paypal_client_secret` / `paypal_mode`），与 [django-oscar-paypal-store](https://github.com/erishen/django-oscar-paypal-store)/.env 里的三项完全一致。
 - PayPal sandbox 偶发 5xx/限流，create 环节带 3 次退避重试；真实链路约 1 分钟。
 - 跑完自动清购物篮；订单留在演示库里便于在 PayPal 后台对账，需要干净演示库时手动 `DELETE FROM orders WHERE id>1` 即可。
 
