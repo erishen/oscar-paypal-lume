@@ -1,6 +1,6 @@
 # oscar-paypal-lume
 
-> This file is the English version; 中文文档：[README.zh-CN.md](README.zh-CN.md)
+> This file is the English version; Chinese (Simplified): [README.zh-CN.md](README.zh-CN.md)
 
 A rewrite of [django-oscar-paypal-store](https://github.com/erishen/django-oscar-paypal-store) (Django Oscar 4.1 + PayPal demo)
 using **lume (host: agent-httpd) + lume-core (language) + Vue3**, with the same business surface:
@@ -25,9 +25,9 @@ make test-e2e-live     # 1 real PayPal sandbox full-chain E2E (real order → gu
 make test-e2e-live-buyer # same but paying with a buyer account (creds decrypted temporarily from Chrome Keychain)
 ```
 
-Open `http://127.0.0.1:8090/` in a browser: Chinese/English (EN|中文 toggle in the header), product grid,
+Open `http://127.0.0.1:8090/` in a browser: Chinese/English (a language toggle in the header), product grid,
 search, detail, basket, `Pay with PayPal` (redirects to sandbox login/approve, then returns to `#/checkout/done`
-for automatic capture reconciliation), order history. A fixed「演示站点 · DEMO」badge sits in the top-right corner.
+for automatic capture reconciliation), order history. A fixed "Demo site · DEMO" badge sits in the top-right corner.
 
 ## Architecture
 
@@ -55,7 +55,7 @@ on hash routes and PayPal return URLs all land in the frontend.
 | `basket.currency` (Oscar default GBP) | `CURRENCY` env, default USD | `CURRENCY=GBP make run` aligns the original sandbox; order & PayPal amounts always share one source |
 | Search (Haystack/Whoosh) | SQL `LIKE` (name/description) | Enough for 140 rows |
 | dashboard real refunds (incl. partial) | `POST /api/admin/orders/:id/refund` | Omit `amount_cents` = full; pass integer cents = partial, order stays paid until fully refunded; local key dedupe + stable `PayPal-Request-Id` = double idempotency; stock restored only on full refund, then status → refunded |
-| django.po i18n | frontend dictionary i18n (en / 中文) | EN\|中文 toggle in the header |
+| django.po i18n | frontend dictionary i18n (en / zh) | EN\|ZH toggle in the header |
 | Templates + DEMO badge | Vue3 SPA + fixed badge | |
 
 ## lume adaptation notes (gotchas)
@@ -92,7 +92,7 @@ on hash routes and PayPal return URLs all land in the frontend.
   - added `rate_limits` / `visits` tables + idempotent migration for old `orders` refund columns; removed the dead `doc_log_api_key` config
   - regression: `make check` / init parse OK; container healthy; `docker-smoke` 23/0 + full 45/0; three real-chain runs (orders 61/62/67) all passed, incl. partial refund → refund rest → idempotent
 - 2026-11-21 (frontend UI alignment):
-  - admin order list gets an amount input + 「退款 / 全额退款」; the real-chain E2E does a partial refund via UI (still paid, cumulative refunded) then refunds the rest via API
+  - admin order list gets an amount input + "Refund / Full refund"; the real-chain E2E does a partial refund via UI (still paid, cumulative refunded) then refunds the rest via API
   - admin product list allows price edits (one PATCH `price_cents` together with stock); E2E restores the original price automatically
   - unauthenticated add-to-cart / restricted access writes `oscar_next`, returning to the original page after login; the source is consumed once, explicit login still lands in the basket
   - English adds `status`; the first screen waits for `/auth/me` before mounting views, removing the unauthenticated-state race
@@ -122,7 +122,7 @@ make test-e2e-live          # guest card payment; explicit target, default test-
 make test-e2e-live-buyer    # buyer-account login payment (creds auto-read from Chrome Keychain)
 ```
 
-Covers: login → add to basket (pick an in-stock product) → real create order → PayPal sandbox payment → return → real capture (order → paid, stock deducted, basket cleared) → **admin UI partial refund** (enter amount, click 「退款」, refund half: still paid, cumulative `refunded_cents`, stock not restored; same amount repeated → 200 already) → **refund the rest** (→ refunded, stock restored) → refund again idempotent.
+Covers: login → add to basket (pick an in-stock product) → real create order → PayPal sandbox payment → return → real capture (order → paid, stock deducted, basket cleared) → **admin UI partial refund** (enter amount, click "Refund", refund half: still paid, cumulative `refunded_cents`, stock not restored; same amount repeated → 200 already) → **refund the rest** (→ refunded, stock restored) → refund again idempotent.
 
 Two payment modes:
 
