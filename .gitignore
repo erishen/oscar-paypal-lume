@@ -4,6 +4,8 @@
 .data/
 logs/
 *.log
+# agent-httpd 运行时 skill 同步产物（llm-router 自动重建 skills/router/，非源码）
+skills/
 # 前端
 web/node_modules/
 web/dist/

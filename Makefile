@@ -56,7 +56,7 @@ docker-context: build-web ## 生成单一构建上下文（lume host + agent-htt
 	    $(LUME_DIR)/ $(DOCKER_CONTEXT)/lume/
 	rsync -a --exclude .git --exclude .data --exclude logs --exclude .docker \
 	    --exclude .secrets.json --exclude '*.db' --exclude .DS_Store \
-	    --exclude web/node_modules \
+	    --exclude web/node_modules --exclude skills \
 	    ./ $(DOCKER_CONTEXT)/app/
 	cp docker/Dockerfile docker/entrypoint.sh $(DOCKER_CONTEXT)/
 
