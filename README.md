@@ -2,8 +2,7 @@
 
 > 项目仓库：[oscar-paypal-lume](https://github.com/erishen/oscar-paypal-lume)
 
-把 [django-oscar-paypal-store](https://github.com/erishen/django-oscar-paypal-store)（Django Oscar 4.1 + PayPal 演示，
-本地对应 `../../personal-site/django-oscar-paypal-store`）用
+把 [django-oscar-paypal-store](https://github.com/erishen/django-oscar-paypal-store)（Django Oscar 4.1 + PayPal 演示）用
 **lume（host：agent-httpd）+ lume-core（语言）+ Vue3** 重写一遍。同一套业务口径：
 商品目录 / 搜索 / 购物篮 / 下单 / **PayPal Orders v2（CAPTURE）幂等支付**（sandbox）+
 **管理后台**（订单全量 / 真退款 / 商品上下架·库存 / 概览统计）。
