@@ -1,0 +1,2203 @@
+// oscar-paypal-lume/app.lume —— lume + agent-httpd 版电商演示（前台）
+//
+// 对标 django-oscar-paypal-store（Oscar 4.1 sandbox）：商品目录 / 搜索 /
+// 购物篮 / 下单 / PayPal Orders v2 CAPTURE（幂等）。管理后台二期。
+//
+// 金额一律整数分（price_cents），避免浮点；图片走 /static/media/<sku>.jpg。
+
+import "lib/support.lume" as s;
+import "lib/db.lume" as db;
+import "lib/auth.lume" as auth;
+import "lib/config.lume" as cfg;
+import "lib/paypal.lume" as pp;
+
+// 货币对齐 Django 的 basket.currency：默认 USD，CURRENCY=GBP 可对齐原 Oscar
+// sandbox 默认英镑（PayPal sandbox 两种币种都支持）。
+let currency = s.env_or("CURRENCY", "USD");
+
+verbs read = ["GET"];
+
+// ---------- 小工具 ----------
+
+func as_int(v, dflt) {
+  if (v == null) { return dflt; }
+  let r = try(() => int(v));
+  if (get(r, "err", null) != null) { return dflt; }
+  return get(r, "ok", dflt);
+}
+
+func as_float(v, dflt) {
+  if (v == null) { return dflt; }
+  let r = try(() => float(v));
+  if (get(r, "err", null) != null) { return dflt; }
+  return get(r, "ok", dflt);
+}
+
+func ends_with(str, suf) {
+  if (suf == null or len(suf) == 0) { return true; }
+  let sl = str + "";
+  return substr(sl, len(sl) - len(suf), len(suf)) == suf;
+}
+
+func starts_with(str, pre) {
+  if (pre == null or len(pre) == 0) { return true; }
+  let sl = str + "";
+  return substr(sl, 0, len(pre)) == pre;
+}
+
+// ---------- 服务配置 ----------
+
+let port_raw = s.env_or("PORT", "8090");
+let workers_raw = s.env_or("WORKERS", "4");
+
+server {
+  port = int(port_raw);
+  workers = int(workers_raw);
+  bind = s.env_or("BIND", "127.0.0.1");
+  docroot = s.env_or("DOCROOT", "./web/dist");
+  no_directory_listing = 1;
+  spa = 1; // Vue3 history 模式：未命中路由 + Accept: text/html → index.html
+  access_log = s.env_or("ACCESS_LOG", "./logs/access.log");
+}
+
+// ============================================================
+// 系统
+// ============================================================
+
+get "/health", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  return s.ok({ status: "ok" });
+};
+
+get "/health/deep", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  if (not db.healthy()) { return s.err(503, "数据库不可用"); }
+  return s.ok({ status: "ok", db: "healthy" });
+};
+
+get "/robots.txt", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let base = s.env_or("BASE_URL", "http://127.0.0.1:" + s.env_or("PORT", "8090"));
+  return { status: 200, type: "text/plain; charset=utf-8",
+           body: "User-agent: *\nAllow: /\nDisallow: /api/admin/\nSitemap: " + base + "/sitemap.xml\n",
+           headers: { "Cache-Control": "public, max-age=86400" } };
+};
+
+// 动态 sitemap：首页 + 关于页 + 全部在售商品（hash 路由 URL）。
+// 注意：SPA 用 hash 路由（/#/product/slug），搜索引擎对 fragment 索引有限——
+// 但结构合法，且 robots.txt 指向它；如未来改 history 路由可直接复用。
+get "/sitemap.xml", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let base = s.env_or("BASE_URL", "http://127.0.0.1:" + s.env_or("PORT", "8090"));
+  let urls = [];
+  // 首页 lastmod：最新在售商品创建时间（首页内容随商品变化）；关于页：内容页更新时间。
+  let home_lm = null;
+  let hrow = db.row("SELECT MAX(created_at) AS m FROM products WHERE displayable = 1", []);
+  if (hrow != null and get(hrow, "m", null) != null) { home_lm = s.iso_or_null(get(hrow, "m", null)); }
+  push(urls, { loc: base + "/", prio: "1.0", freq: "daily", lastmod: home_lm });
+  let about_lm = null;
+  let arow = db.row("SELECT updated_at FROM flatpages WHERE url = '/about/' LIMIT 1", []);
+  if (arow != null and get(arow, "updated_at", null) != null) { about_lm = s.iso_or_null(get(arow, "updated_at", null)); }
+  push(urls, { loc: base + "/#/page/about", prio: "0.5", freq: "monthly", lastmod: about_lm });
+  let rows = db.q("SELECT slug, created_at, image FROM products WHERE displayable = 1 ORDER BY slug", []);
+  if (rows != null) {
+    for (r in rows) {
+      let sl = s.str_or(get(r, "slug", ""), "");
+      if (len(sl) > 0) {
+        push(urls, { loc: base + "/#/product/" + sl, prio: "0.8", freq: "weekly",
+                     lastmod: s.iso_or_null(get(r, "created_at", null)),
+                     image: s.str_or(get(r, "image", ""), "") });
+      }
+    }
+  }
+  let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" xmlns:image=\"http://www.google.com/schemas/sitemap-image/1.1\">\n";
+  for (u in urls) {
+    xml = xml + "  <url><loc>" + get(u, "loc", "") + "</loc>";
+    let lm = get(u, "lastmod", null);
+    if (lm != null and len(str(lm)) > 0) { xml = xml + "<lastmod>" + str(lm) + "</lastmod>"; }
+    xml = xml + "<changefreq>" + get(u, "freq", "weekly") + "</changefreq><priority>" + get(u, "prio", "0.5") + "</priority>";
+    // 商品封面图（Google Images 扩展；image 字段是 /static/media/ 下的 ISBN 文件名，URL 安全）
+    let im = get(u, "image", null);
+    if (im != null and len(str(im)) > 0) {
+      xml = xml + "<image:image><image:loc>" + base + "/static/media/" + str(im) + "</image:loc></image:image>";
+    }
+    xml = xml + "</url>\n";
+  }
+  xml = xml + "</urlset>\n";
+  return { status: 200, type: "application/xml; charset=utf-8", body: xml,
+           headers: { "Cache-Control": "public, max-age=3600" } };
+};
+
+// ============================================================
+// 静态资源：Vue3 构建产物 + 商品图
+//   /static/*  → STATIC_DIR（默认 ./static，media/ 下放商品图）
+// 其余未命中路由由宿主 docroot（./web）+ SPA fallback 兜住。
+// ============================================================
+
+func static_dir() { return s.env_or("STATIC_DIR", "./static"); }
+
+func static_mime(name) {
+  let lower_name = lower(name);
+  if (ends_with(lower_name, ".html")) { return "text/html; charset=utf-8"; }
+  if (ends_with(lower_name, ".css")) { return "text/css; charset=utf-8"; }
+  if (ends_with(lower_name, ".js")) { return "application/javascript; charset=utf-8"; }
+  if (ends_with(lower_name, ".json")) { return "application/json; charset=utf-8"; }
+  if (ends_with(lower_name, ".png")) { return "image/png"; }
+  if (ends_with(lower_name, ".jpg") or ends_with(lower_name, ".jpeg")) { return "image/jpeg"; }
+  if (ends_with(lower_name, ".webp")) { return "image/webp"; }
+  if (ends_with(lower_name, ".svg")) { return "image/svg+xml"; }
+  if (ends_with(lower_name, ".ico")) { return "image/x-icon"; }
+  if (ends_with(lower_name, ".gif")) { return "image/gif"; }
+  if (ends_with(lower_name, ".txt")) { return "text/plain; charset=utf-8"; }
+  return "application/octet-stream";
+}
+
+func static_rel_ok(rel) {
+  if (rel == null) { return false; }
+  if (len(rel) == 0 or len(rel) > 256) { return false; }
+  if (contains(rel, "..") or contains(rel, "\\")) { return false; }
+  if (substr(rel, 0, 1) == "." or substr(rel, 0, 1) == "/") { return false; }
+  let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./";
+  let i = 0;
+  while (i < len(rel)) {
+    if (not contains(allowed, substr(rel, i, 1))) { return false; }
+    i = i + 1;
+  }
+  if (contains(rel, "//")) { return false; }
+  return true;
+}
+
+// RFC 7233 单区间：bytes=N-M / bytes=N- / bytes=-N；无法满足 416。
+func range_of(total, spec) {
+  let v = trim(s.str_or(spec, ""));
+  if (not (substr(v, 0, 6) == "bytes=")) { return null; }
+  let rng = substr(v, 6, len(v) - 6);
+  if (contains(rng, ",")) { return null; }
+  let parts = split(rng, "-");
+  if (len(parts) != 2) { return null; }
+  let a = trim(parts[0]);
+  let b = trim(parts[1]);
+  if (len(a) == 0 and len(b) == 0) { return null; }
+  let start = 0;
+  let end = total - 1;
+  if (len(a) == 0) {
+    let n = int(b);
+    if (n <= 0) { return null; }
+    start = total - n;
+    if (start < 0) { start = 0; }
+  } else {
+    start = int(a);
+    if (len(b) > 0) { end = int(b); }
+  }
+  if (start < 0 or start >= total or end < start) { return null; }
+  if (end >= total) { end = total - 1; }
+  return { start: start, end: end };
+}
+
+// 静态文件缓存：商品图（media/<sku>.jpg）按 SKU 命名基本不变，长缓存；
+// 其余静态资源用中等缓存。SPA 自身 /assets/* 由 docroot 处理器带 no-cache + ETag。
+func static_cache(rel) {
+  let lr = lower(rel);
+  if (contains(lr, "media/")) { return "public, max-age=604800"; } // 7 天
+  return "public, max-age=3600"; // 1 小时
+}
+
+func static_res(req) {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+
+  let raw = s.str_or(get(req, "path", ""), "");
+  let bare = split(raw, "?")[0];
+  let prefix = "/static/";
+  if (len(bare) <= len(prefix) or not (substr(bare, 0, len(prefix)) == prefix)) {
+    return s.err(404, "Not Found");
+  }
+  let rel = substr(bare, len(prefix), len(bare) - len(prefix));
+  if (not static_rel_ok(rel)) { return s.err(404, "Not Found"); }
+
+  let r = try(() => read_file(static_dir() + "/" + rel));
+  if (get(r, "err", null) != null or get(r, "ok", null) == null) {
+    return s.err(404, "Not Found");
+  }
+  let body_all = get(r, "ok", "");
+  let total = len(body_all);
+  let mime = static_mime(rel);
+  let cache_hdr = static_cache(rel);
+
+  let spec = get(req, "range", null);
+  if (spec != null) {
+    let rg = try(() => range_of(total, spec));
+    if (get(rg, "err", null) == null and get(rg, "ok", null) != null) {
+      let w = get(rg, "ok", {});
+      return {
+        status: 206,
+        type: mime,
+        body: substr(body_all, get(w, "start", 0), get(w, "end", 0) - get(w, "start", 0) + 1),
+        headers: {
+          "Content-Range": "bytes " + stringify(get(w, "start", 0)) + "-" + stringify(get(w, "end", 0)) + "/" + stringify(total),
+          "Cache-Control": cache_hdr
+        }
+      };
+    }
+    return {
+      status: 416,
+      type: "text/plain; charset=utf-8",
+      body: "Range Not Satisfiable",
+      headers: { "Content-Range": "bytes */" + stringify(total) }
+    };
+  }
+
+  return { status: 200, type: mime, body: body_all, headers: { "Cache-Control": cache_hdr } };
+}
+
+// SPA 构建产物：content-hash 文件名（app-<hash>.js / style-<hash>.css）不可变 → 长缓存 immutable。
+// 未命中/路径穿越 404；index.html 本身仍走 docroot（no-cache，保证拿到最新引用）。
+func assets_dir() { return s.env_or("DOCROOT", "./web/dist") + "/assets"; }
+func assets_res(req) {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let raw = s.str_or(get(req, "path", ""), "");
+  let bare = split(raw, "?")[0];
+  let prefix = "/assets/";
+  if (len(bare) <= len(prefix) or not (substr(bare, 0, len(prefix)) == prefix)) {
+    return s.err(404, "Not Found");
+  }
+  let rel = substr(bare, len(prefix), len(bare) - len(prefix));
+  if (not static_rel_ok(rel)) { return s.err(404, "Not Found"); }
+  let r = try(() => read_file(assets_dir() + "/" + rel));
+  if (get(r, "err", null) != null or get(r, "ok", null) == null) { return s.err(404, "Not Found"); }
+  return {
+    status: 200,
+    type: static_mime(rel),
+    body: get(r, "ok", ""),
+    headers: { "Cache-Control": "public, max-age=31536000, immutable" }
+  };
+}
+get "/assets/*", assets_res;
+route "HEAD", "/assets/*", assets_res;
+
+get "/static/*", static_res;
+route "HEAD", "/static/*", static_res;
+
+// ============================================================
+// 认证（演示账号：admin/admin123456 与 Oscar sandbox 的 quick-admin 一致）
+// ============================================================
+
+post "/auth/login", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let username = lower(trim(s.str_or(get(b, "username", ""), "")));
+  let password = s.str_or(get(b, "password", ""), "");
+  // 按用户名失败锁定（爆破防护）：已锁 → 直接 429，不泄露用户是否存在
+  if (s.auth_fail_locked(username)) {
+    return s.err(429, "登录失败次数过多，请稍后再试");
+  }
+  let u = auth.user_by_name(username);
+  if (u == null or not auth.verify_password(get(u, "password_hash", ""), password, username)) {
+    // 失败：计数；达到阈值返回 429 锁定（避免泄露"用户名/口令错误"给爆破器）
+    let f = s.auth_fail_hit(username);
+    if (get(f, "locked", false)) {
+      return s.err(429, "登录失败次数过多，请稍后再试");
+    }
+    return s.err(401, "用户名或口令错误");
+  }
+  // 成功：清除失败计数
+  s.auth_fail_reset(username);
+  let token = auth.issue_token(username);
+  return s.json_res(200, {
+    access_token: token,
+    token_type: "bearer",
+    username: username,
+    role: get(u, "role", "customer")
+  }, { "Set-Cookie": auth.cookie_header(token) });
+};
+
+post "/auth/logout", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  return s.json_res(200, { message: "已退出登录" }, { "Set-Cookie": auth.clear_cookie_header() });
+};
+
+get "/auth/me", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let sess = auth.session(req);
+  // 未登录返回 200 + authenticated:false（前端 checkAuth 据此置空 user），
+  // 避免每次页面加载浏览器把 401 当错误打 console。
+  if (sess == null) { return s.ok({ authenticated: false, username: null, role: "guest", email: null }); }
+  let u = db.row("SELECT email FROM users WHERE username = ?", [get(sess, "user", "")]);
+  return s.ok({
+    authenticated: true,
+    username: get(sess, "user", ""),
+    role: get(sess, "role", "customer"),
+    email: u == null ? null : get(u, "email", null)
+  });
+};
+
+// ============================================================
+// 目录
+// ============================================================
+
+func product_obj(r) {
+  if (r == null) { return null; }
+  return {
+    id: as_int(get(r, "id", 0), 0),
+    sku: s.str_or(get(r, "sku", ""), ""),
+    slug: s.str_or(get(r, "slug", ""), ""),
+    name: s.str_or(get(r, "name", ""), ""),
+    description: get(r, "description", null),
+    category: get(r, "category", null),
+    category_path: get(r, "category_path", null),
+    price: as_int(get(r, "price_cents", 0), 0) / 100.0,
+    price_cents: as_int(get(r, "price_cents", 0), 0),
+    stock: as_int(get(r, "stock", 0), 0),
+    image: get(r, "image", null),
+    displayable: as_int(get(r, "displayable", 1), 1) != 0,
+    related: []
+  };
+}
+
+func product_list(rows) {
+  let out = [];
+  if (rows == null) { return out; }
+  // 列表 description 截断长度：env DESC_TRUNC（默认 140），0=不截断（保留完整）。
+  let trunc = as_int(s.env_or("DESC_TRUNC", "140"), 140);
+  for (r in rows) {
+    let p = product_obj(r);
+    // 列表不带完整 description（卡片/首页不显示；详情 /api/products/:slug 才要完整），
+    // 100 条列表可省 ~15KB payload。截断保留前 DESC_TRUNC 字符。
+    let d = get(p, "description", null);
+    if (trunc > 0 and d != null and len(d) > trunc) { p.description = substr(d, 0, trunc) + "…"; }
+    push(out, p);
+  }
+  return out;
+}
+
+get "/api/products/", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let cat = s.str_or(get(req.query_params, "category", ""), "");
+  if (len(cat) > 100) { return s.err(422, "category 过长（≤100）"); }
+  let skip = s.q_int(req, "skip", 0);
+  let limit = s.q_int(req, "limit", 24);
+  if (limit < 1) { limit = 24; }
+  if (limit > 500) { limit = 500; }
+  if (skip < 0) { skip = 0; }
+
+  let sql = "SELECT * FROM products WHERE displayable = 1";
+  let params = [];
+  if (len(cat) > 0) {
+    sql = sql + " AND category = ?";
+    push(params, cat);
+  }
+  sql = sql + " ORDER BY name LIMIT ? OFFSET ?";
+  push(params, string(limit));
+  push(params, string(skip));
+  let rows = db.q(sql, params);
+  let total = as_int(get(db.q0("SELECT COUNT(*) AS n FROM products WHERE displayable = 1")[0], "n", 0), 0);
+  // 公共列表短缓存：60s（库存有 ≤60s 滞后，demo 可接受；显著降首页重复请求）。
+  return s.json_res(200, { count: total, results: product_list(rows) },
+                    { "Cache-Control": "public, max-age=60" });
+};
+
+get "/api/products/search", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let kw = s.str_or(get(req.query_params, "q", get(req.query_params, "keyword", "")), "");
+  if (len(kw) == 0) { return s.err(422, "缺少 q/keyword"); }
+  // 防超长 LIKE 拖慢/滥用
+  if (len(kw) > 80) { return s.err(422, "关键词过长（≤80）"); }
+  // 可选 category：`?q=x&category=图书` 只在分类内搜（深链/分类内搜索框）
+  let cat = s.str_or(get(req.query_params, "category", ""), "");
+  if (len(cat) > 100) { return s.err(422, "category 过长（≤100）"); }
+  let like = "%" + kw + "%";
+  let sql = "SELECT * FROM products WHERE displayable = 1 AND (name LIKE ? OR description LIKE ?)";
+  let params = [like, like];
+  if (len(cat) > 0) { sql = sql + " AND category = ?"; push(params, cat); }
+  sql = sql + " ORDER BY name LIMIT 50";
+  let rows = db.q(sql, params);
+  return s.ok({ count: len(rows), results: product_list(rows) });
+};
+
+get "/api/categories/", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT category, COUNT(*) AS n FROM products WHERE displayable = 1 AND category IS NOT NULL GROUP BY category ORDER BY category");
+  let out = [];
+  if (rows != null) {
+    for (r in rows) {
+      push(out, { name: get(r, "category", ""), count: as_int(get(r, "n", 0), 0) });
+    }
+  }
+  // 分类集变更极少（仅 admin 增删改），1h 缓存：导航/首页反复请求直读缓存。
+  return s.json_res(200, { categories: out }, { "Cache-Control": "public, max-age=3600" });
+};
+
+get "/api/products/:slug", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let slug = s.str_or(get(req.params, "slug", ""), "");
+  let r = db.row("SELECT * FROM products WHERE slug = ? AND displayable = 1", [slug]);
+  if (r == null) { return s.err(404, "商品未找到"); }
+  let p = product_obj(r);
+  // 评价聚合（SEO Product.aggregateRating 用）：仅已通过(status=1)；
+  // score 为 1-5 量纲。详情缓存 max-age=60，评价变更 ≤60s 生效（同库存权衡）。
+  let rev = db.row("SELECT COUNT(*) AS n, COALESCE(AVG(score),0) AS avg FROM reviews WHERE product_id = ? AND status = 1",
+                   [string(get(r, "id", ""))]);
+  p.review_count = as_int(get(rev, "n", 0), 0);
+  p.review_avg = as_float(get(rev, "avg", 0), 0);
+  let more = db.q("SELECT * FROM products WHERE displayable = 1 AND category = ? AND id != ? ORDER BY name LIMIT 4",
+                   [get(r, "category", ""), string(get(r, "id", ""))]);
+  p.related = product_list(more);
+  // 详情短缓存 60s：库存有 ≤60s 滞后（同列表权衡）；回访/刷新直读缓存。
+  return s.json_res(200, p, { "Cache-Control": "public, max-age=60" });
+};
+
+// ============================================================
+// 购物篮（按登录用户持久化；未登录 401）
+// ============================================================
+
+func basket_user_id(req) {
+  let fail = auth.require_login(req);
+  if (fail != null) { return null; }
+  let sess = auth.session(req);
+  let u = db.row("SELECT id FROM users WHERE username = ?", [get(sess, "user", "")]);
+  if (u == null) { return null; }
+  return as_int(get(u, "id", 0), 0);
+}
+
+// 优惠券折扣：对齐 Oscar 的 voucher benefit（percentage/absolute）+ 有效期/门槛/总量限制。
+// 单项价格不打折（Oscar facade 同样只在 basket total 上体现折扣）。
+func basket_discount(b_id, subtotal) {
+  let out = { discount_cents: 0, voucher: null };
+  if (subtotal <= 0) { return out; }
+  let rows = db.q("SELECT v.* FROM basket_vouchers bv JOIN vouchers v ON v.id = bv.voucher_id WHERE bv.basket_id = ? ORDER BY v.id", [string(b_id)]);
+  if (rows == null or len(rows) == 0) { return out; }
+  for (v in rows) {
+    if (as_int(get(v, "active", 0), 0) != 1) { continue; }
+    let start = get(v, "start_at", null);
+    let end = get(v, "end_at", null);
+    if (start != null and as_int(start, 0) > now()) { continue; }
+    if (end != null and as_int(end, 0) < now()) { continue; }
+    let limit = as_int(get(v, "usage_limit", 0), 0);
+    if (limit > 0 and as_int(get(v, "num_orders", 0), 0) >= limit) { continue; }
+    let min_sub = as_int(get(v, "min_subtotal_cents", 0), 0);
+    if (subtotal < min_sub) { continue; }
+    let value = as_int(get(v, "value", 0), 0);
+    let d = 0;
+    if (s.str_or(get(v, "discount_type", ""), "") == "percentage") {
+      d = int(subtotal * value / 100);
+      let cap = as_int(get(v, "max_discount_cents", 0), 0);
+      if (cap > 0 and d > cap) { d = cap; }
+    } else {
+      d = value;
+    }
+    if (d > subtotal) { d = subtotal; }
+    if (d > as_int(get(out, "discount_cents", 0), 0)) {
+      put(out, "discount_cents", d);
+      put(out, "voucher", {
+        id: as_int(get(v, "id", 0), 0),
+        code: s.str_or(get(v, "code", ""), ""),
+        name: s.str_or(get(v, "name", ""), ""),
+        discount_type: s.str_or(get(v, "discount_type", ""), ""),
+        value: value
+      });
+    }
+  }
+  return out;
+}
+
+func basket_view(req) {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let b = db.row("SELECT * FROM baskets WHERE user_id = ?", [string(uid)]);
+  let b_id = 0;
+  if (b != null) {
+    b_id = as_int(get(b, "id", 0), 0);
+  } else {
+    db.exec("INSERT INTO baskets (user_id, updated_at) VALUES (?, ?)", [string(uid), string(now())]);
+    // db.exec 返回影响行数，不是 lastrowid；必须回查，否则新用户会串到 id=1 的篮子里
+    let created = db.row("SELECT id FROM baskets WHERE user_id = ?", [string(uid)]);
+    b_id = as_int(get(created, "id", 0), 0);
+  }
+  if (b_id <= 0) { return s.err(500, "购物篮初始化失败"); }
+  let rows = db.q("SELECT pi.id AS basket_item_id, pi.product_id AS product_id, pi.quantity, " +
+                  "p.name, p.slug, p.price_cents, p.stock, p.image " +
+                  "FROM basket_items pi JOIN products p ON p.id = pi.product_id " +
+                  "WHERE pi.basket_id = ? ORDER BY p.name", [string(b_id)]);
+  let items = [];
+  let total_cents = 0;
+  let item_count = 0;
+  if (rows != null) {
+    for (r in rows) {
+      let qty = as_int(get(r, "quantity", 0), 0);
+      let pc = as_int(get(r, "price_cents", 0), 0);
+      total_cents = total_cents + pc * qty;
+      item_count = item_count + qty;
+      push(items, {
+        product_id: as_int(get(r, "product_id", 0), 0),
+        sku: s.str_or(get(r, "sku", ""), ""),
+        name: s.str_or(get(r, "name", ""), ""),
+        slug: s.str_or(get(r, "slug", ""), ""),
+        price: pc / 100.0,
+        price_cents: pc,
+        stock: as_int(get(r, "stock", 0), 0),
+        image: get(r, "image", null),
+        quantity: qty,
+        line_total_cents: pc * qty
+      });
+    }
+  }
+  let subtotal_cents = total_cents;
+  let disc = basket_discount(b_id, subtotal_cents);
+  let discount_cents = as_int(get(disc, "discount_cents", 0), 0);
+  let payable_cents = subtotal_cents - discount_cents;
+  return s.ok({
+    items: items, item_count: item_count,
+    subtotal_cents: subtotal_cents, discount_cents: discount_cents,
+    total: payable_cents / 100.0, total_cents: payable_cents,
+    voucher: get(disc, "voucher", null)
+  });
+}
+
+get "/api/basket/", basket_view;
+
+func basket_add(req) {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let pid = as_int(get(b, "product_id", 0), 0);
+  let qty = as_int(get(b, "quantity", 1), 1);
+  if (pid <= 0) { return s.err(422, "product_id 非法"); }
+  if (qty < 1) { qty = 1; }
+  if (qty > 99) { qty = 99; }
+
+  let p = db.row("SELECT id, stock FROM products WHERE id = ? AND displayable = 1", [string(pid)]);
+  if (p == null) { return s.err(404, "商品未找到"); }
+
+  let row = db.row("SELECT id FROM baskets WHERE user_id = ?", [string(uid)]);
+  let b_id = 0;
+  if (row != null) {
+    b_id = as_int(get(row, "id", 0), 0);
+  } else {
+    db.exec("INSERT INTO baskets (user_id, updated_at) VALUES (?, ?)", [string(uid), string(now())]);
+    // db.exec 返回影响行数，不是 lastrowid；必须回查，否则新用户会串到 id=1 的篮子里
+    let created = db.row("SELECT id FROM baskets WHERE user_id = ?", [string(uid)]);
+    b_id = as_int(get(created, "id", 0), 0);
+  }
+  if (b_id <= 0) { return s.err(500, "购物篮初始化失败"); }
+
+  let existing = db.row("SELECT quantity FROM basket_items WHERE basket_id = ? AND product_id = ?",
+                        [string(b_id), string(pid)]);
+  let cur = 0;
+  if (existing != null) { cur = as_int(get(existing, "quantity", 0), 0); }
+  let new_qty = cur + qty;
+  let stock = as_int(get(p, "stock", 0), 0);
+  if (stock > 0 and new_qty > stock) {
+    return s.err(409, "库存不足（当前 " + string(stock) + "）");
+  }
+
+  if (existing != null) {
+    db.exec("UPDATE basket_items SET quantity = ? WHERE basket_id = ? AND product_id = ?",
+            [string(new_qty), string(b_id), string(pid)]);
+  } else {
+    db.exec("INSERT INTO basket_items (basket_id, product_id, quantity) VALUES (?, ?, ?)",
+            [string(b_id), string(pid), string(new_qty)]);
+  }
+  db.exec("UPDATE baskets SET updated_at = ? WHERE id = ?", [string(now()), string(b_id)]);
+  return s.ok({ product_id: pid, quantity_in_basket: new_qty });
+};
+
+post "/api/basket/", basket_add;
+
+// 移除券：必须注册在 delete "/api/basket/:product_id" 之前，
+// 否则字面量 "voucher" 会被参数路由吃掉（lume 按注册顺序匹配）。
+delete "/api/basket/voucher", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let b_id = basket_id_for(uid);
+  db.exec("DELETE FROM basket_vouchers WHERE basket_id = ?", [string(b_id)]);
+  let body = view_body(basket_view(req));
+  return s.ok({ message: "券已移除", total_cents: get(body, "total_cents", 0) });
+};
+
+func basket_remove(req) {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let pid = as_int(get(req.params, "product_id", 0), 0);
+  if (pid <= 0) { return s.err(422, "product_id 非法"); }
+  let row = db.row("SELECT id FROM baskets WHERE user_id = ?", [string(uid)]);
+  if (row != null) {
+    db.exec("DELETE FROM basket_items WHERE basket_id = ? AND product_id = ?",
+            [string(get(row, "id", "")), string(pid)]);
+  }
+  return s.ok({ message: "已移除" });
+};
+
+delete "/api/basket/:product_id", basket_remove;
+
+// 设数量（减/增都走这里；qty=0 等价于移除）
+func basket_set(req) {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let pid = as_int(get(req.params, "product_id", 0), 0);
+  let b = s.parse_body(req);
+  let qty = as_int(get(b, "quantity", 0), 0);
+  if (pid <= 0) { return s.err(422, "product_id 非法"); }
+  if (qty < 0 or qty > 99) { return s.err(422, "quantity 需在 0..99"); }
+  let row = db.row("SELECT id FROM baskets WHERE user_id = ?", [string(uid)]);
+  if (row == null) {
+    return s.ok({ product_id: pid, quantity_in_basket: 0 });
+  }
+  let b_id = as_int(get(row, "id", 0), 0);
+  if (qty == 0) {
+    db.exec("DELETE FROM basket_items WHERE basket_id = ? AND product_id = ?", [string(b_id), string(pid)]);
+    return s.ok({ product_id: pid, quantity_in_basket: 0 });
+  }
+  let p = db.row("SELECT stock FROM products WHERE id = ? AND displayable = 1", [string(pid)]);
+  if (p == null) { return s.err(404, "商品未找到"); }
+  let stock = as_int(get(p, "stock", 0), 0);
+  if (stock > 0 and qty > stock) { return s.err(409, "库存不足（当前 " + string(stock) + "）"); }
+  let existing = db.row("SELECT quantity FROM basket_items WHERE basket_id = ? AND product_id = ?", [string(b_id), string(pid)]);
+  if (existing != null) {
+    db.exec("UPDATE basket_items SET quantity = ? WHERE basket_id = ? AND product_id = ?", [string(qty), string(b_id), string(pid)]);
+  } else {
+    db.exec("INSERT INTO basket_items (basket_id, product_id, quantity) VALUES (?, ?, ?)", [string(b_id), string(pid), string(qty)]);
+  }
+  db.exec("UPDATE baskets SET updated_at = ? WHERE id = ?", [string(now()), string(b_id)]);
+  return s.ok({ product_id: pid, quantity_in_basket: qty });
+};
+
+patch "/api/basket/:product_id", basket_set;
+
+// ============================================================
+// 订单 + PayPal Orders v2 CAPTURE（幂等；capture 前 GET 对账，重复捕获视为成功）
+// ============================================================
+
+func order_obj(r) {
+  if (r == null) { return null; }
+  let o = {
+    id: as_int(get(r, "id", 0), 0),
+    order_no: s.str_or(get(r, "order_no", ""), ""),
+    status: s.str_or(get(r, "status", "pending"), "pending"),
+    total: as_int(get(r, "total_cents", 0), 0) / 100.0,
+    total_cents: as_int(get(r, "total_cents", 0), 0),
+    currency: s.str_or(get(r, "currency", currency), currency),
+    item_count: as_int(get(r, "item_count", 0), 0),
+    paypal_order_id: get(r, "paypal_order_id", null),
+    paypal_capture_id: get(r, "paypal_capture_id", null),
+    refunded_cents: as_int(get(r, "refunded_cents", 0), 0),
+    discount_cents: as_int(get(r, "discount_cents", 0), 0),
+    voucher_code: get(r, "voucher_code", null),
+    guest_email: get(r, "guest_email", null),
+    created_at: s.iso_or_null(get(r, "created_at", null)),
+    paid_at: s.iso_or_null(get(r, "paid_at", null)),
+    items: [],
+    refunds: [],
+    username: ""
+  };
+  let raw_items = get(r, "items_json", null);
+  if (raw_items != null and len(raw_items) > 0) {
+    let j = try(() => json(raw_items));
+    if (get(j, "err", null) == null) { o.items = get(j, "ok", []); }
+  }
+  let raw_refunds = get(r, "refunds_json", null);
+  if (raw_refunds != null and len(raw_refunds) > 0) {
+    let jr = try(() => json(raw_refunds));
+    if (get(jr, "err", null) == null) { o.refunds = get(jr, "ok", []); }
+  }
+  return o;
+}
+
+// 下单：把购物篮转成 pending 订单，调 PayPal create order，返回 approve 链接。
+// 幂等：同一 basket 未完结的 pending 订单复用同一 paypal_order_id。
+post "/api/orders/", (req) => {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+
+  let b = s.parse_body(req);
+  if (b == null) { b = {}; }
+  let return_url = s.str_or(get(b, "return_url", s.env_or("BASE_URL", "http://127.0.0.1:" + s.env_or("PORT", "8090")) + "/#/checkout/done"), "");
+  let cancel_url = s.str_or(get(b, "cancel_url", s.env_or("BASE_URL", "http://127.0.0.1:" + s.env_or("PORT", "8090")) + "/#/basket"), "");
+
+  let row = db.row("SELECT id FROM baskets WHERE user_id = ?", [string(uid)]);
+  if (row == null) { return s.err(400, "购物篮为空"); }
+  let b_id = as_int(get(row, "id", 0), 0);
+  let items = db.q("SELECT pi.quantity, p.id, p.name, p.sku, p.price_cents, p.stock " +
+                   "FROM basket_items pi JOIN products p ON p.id = pi.product_id " +
+                   "WHERE pi.basket_id = ? AND p.displayable = 1 ORDER BY p.id", [string(b_id)]);
+  if (items == null or len(items) == 0) { return s.err(400, "购物篮为空"); }
+
+  // 库存校验（Oscar 语义：超过 stock=0 视为不限量）
+  let payload_items = [];
+  let total_cents = 0;
+  let item_count = 0;
+  for (it in items) {
+    let qty = as_int(get(it, "quantity", 0), 0);
+    let pc = as_int(get(it, "price_cents", 0), 0);
+    let stock = as_int(get(it, "stock", 0), 0);
+    if (stock > 0 and qty > stock) {
+      return s.err(409, "「" + s.str_or(get(it, "name", ""), "") + "」库存不足（" + string(stock) + "）");
+    }
+    total_cents = total_cents + pc * qty;
+    item_count = item_count + qty;
+    push(payload_items, {
+      product_id: as_int(get(it, "id", 0), 0),
+      sku: s.str_or(get(it, "sku", ""), ""),
+      name: s.str_or(get(it, "name", ""), ""),
+      quantity: qty,
+      price_cents: pc,
+      line_total_cents: pc * qty
+    });
+  }
+  if (total_cents <= 0) { return s.err(400, "购物篮金额无效"); }
+  // 券折扣在 basket total 上体现；PayPal 支付金额 = 折后金额（对齐 Oscar facade）
+  let disc = basket_discount(b_id, total_cents);
+  let discount_cents = as_int(get(disc, "discount_cents", 0), 0);
+  let voucher_code = "";
+  let vobj = get(disc, "voucher", null);
+  if (vobj != null) { voucher_code = s.str_or(get(vobj, "code", ""), ""); }
+  total_cents = total_cents - discount_cents;
+  if (total_cents <= 0) { return s.err(400, "券折扣后金额无效"); }
+
+  // 复用未完结订单：只有同一幂等 key 才复用；不同 key 视为新结算，旧 pending 先转 canceled，
+  // 否则回跳时用新 key 查不到旧订单，结算会 404。
+  let idem = s.str_or(get(b, "key", ""), "");
+  if (len(idem) == 0) { idem = s.str_or(get(b, "idempotency_key", ""), ""); }
+  let pending = db.row("SELECT * FROM orders WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1", [string(uid)]);
+  let o = null;
+  if (pending != null and (len(idem) == 0 or ends_with(s.str_or(get(pending, "order_no", ""), ""), "-" + idem))) {
+    o = pending;
+  }
+  if (o == null) {
+    if (pending != null) {
+      db.exec("UPDATE orders SET status = 'canceled' WHERE id = ?", [string(get(pending, "id", 0))]);
+    }
+    let order_no = "O-" + string(now()) + "-" + idem;
+    // 订单追踪邮箱：客户端可显式传 email，否则取账户邮箱（Oscar 订单 email 字段语义）
+    let guest_email = lower(trim(s.str_or(get(b, "email", ""), "")));
+    if (len(guest_email) == 0) {
+      let u = db.row("SELECT email FROM users WHERE id = ?", [string(uid)]);
+      if (u != null) { guest_email = lower(trim(s.str_or(get(u, "email", ""), ""))); }
+    }
+    let w = db.exec(
+      "INSERT INTO orders (order_no, user_id, status, total_cents, currency, item_count, items_json, guest_email, voucher_code, discount_cents, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+      [order_no, string(uid), "pending", string(total_cents), currency, string(item_count),
+       stringify(payload_items), guest_email, voucher_code, string(discount_cents), string(now())]);
+    if (w == null or w < 1) { return s.err(500, "订单写入失败"); }
+    o = db.row("SELECT * FROM orders WHERE user_id = ? AND status = 'pending' ORDER BY id DESC LIMIT 1", [string(uid)]);
+  }
+  if (o == null) { return s.err(500, "订单创建失败"); }
+  let order_id = as_int(get(o, "id", 0), 0);
+
+  let pp_fail = pp.create_order_for(order_id, payload_items, total_cents, currency, return_url, cancel_url);
+  if (pp_fail != null) { return pp_fail; }
+  let pp_state = pp.last_state();
+  return s.created({
+    order_id: order_id,
+    order_no: s.str_or(get(o, "order_no", ""), ""),
+    status: "pending",
+    total: total_cents / 100.0,
+    total_cents: total_cents,
+    currency: currency,
+    approve_url: pp_state.approve_url
+  });
+};
+
+// 支付回调（key 版）：PayPal 跳回 return_url（/checkout/done?key=…&token=…），
+// 前端用创建订单时的 idempotency key 定位 pending 订单再对账 capture。
+get "/api/orders/complete", (req) => {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let key = s.str_or(get(req.query_params, "key", ""), "");
+  let o = db.row("SELECT * FROM orders WHERE user_id = ? AND status = 'pending' AND order_no LIKE ? ORDER BY id DESC LIMIT 1",
+                 [string(uid), "%-" + key]);
+  if (o == null) { return s.err(404, "未找到待支付订单（key=" + key + "）"); }
+  let done = complete_order(req, o, s.str_or(get(req.query_params, "token", ""), ""));
+  if (done != null) { return done; }
+  return null;
+};
+
+// 通用 complete 逻辑：幂等 capture + 扣库存 + 清篮
+func complete_order(req, o, buyer_token) {
+  let order_id = as_int(get(o, "id", 0), 0);
+  let uid = as_int(get(o, "user_id", 0), 0);
+  let status = s.str_or(get(o, "status", "pending"), "pending");
+
+  if (status == "paid") { return s.ok({ order_id: order_id, status: "paid", already: true }); }
+  if (status == "refunded") { return s.ok({ order_id: order_id, status: "refunded", already: true }); }
+
+  let pp_fail = pp.capture_order(order_id, s.str_or(get(o, "paypal_order_id", ""), ""), buyer_token);
+  if (pp_fail != null) {
+    db.exec("UPDATE orders SET status = ? WHERE id = ?", ["failed", string(order_id)]);
+    return pp_fail;
+  }
+  let st = pp.last_state();
+  let total_cents = as_int(get(o, "total_cents", 0), 0);
+
+  let items = try(() => json(get(o, "items_json", "[]")));
+  let plist = get(items, "ok", []);
+  let i = 0;
+  while (i < len(plist)) {
+    let it = get(plist, i, {});
+    let pid = string(as_int(get(it, "product_id", 0), 0));
+    let qty = as_int(get(it, "quantity", 0), 0);
+    // 原子扣减（单语句，避免读-改-写丢更新/并发超卖）：stock 下限 0
+    if (len(pid) > 0 and qty > 0) {
+      db.exec("UPDATE products SET stock = MAX(0, stock - ?) WHERE id = ?", [string(qty), pid]);
+    }
+    i = i + 1;
+  }
+
+  db.exec("DELETE FROM basket_items WHERE basket_id IN (SELECT id FROM baskets WHERE user_id = ?)", [string(uid)]);
+  // 券使用计数 + 清掉购物篮上的券（对齐 Oscar Voucher.record_usage）
+  let used_code = s.str_or(get(o, "voucher_code", ""), "");
+  if (len(used_code) > 0) {
+    db.exec("UPDATE vouchers SET num_orders = num_orders + 1 WHERE upper(code) = ?", [upper(used_code)]);
+    db.exec("DELETE FROM basket_vouchers WHERE basket_id IN (SELECT id FROM baskets WHERE user_id = ?)", [string(uid)]);
+  }
+  db.exec("UPDATE orders SET status = ?, paypal_capture_id = ?, paid_at = ? WHERE id = ?",
+          ["paid", st.capture_id, string(now()), string(order_id)]);
+  return s.ok({
+    order_id: order_id,
+    order_no: s.str_or(get(o, "order_no", ""), ""),
+    status: "paid",
+    total: total_cents / 100.0,
+    total_cents: total_cents,
+    currency: s.str_or(get(o, "currency", "USD"), "USD")
+  });
+};
+
+// 支付回调（order_id 版；测试/直连用）
+get "/api/orders/:order_id/complete", (req) => {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+
+  let order_id = as_int(get(req.params, "order_id", 0), 0);
+  let o = db.row("SELECT * FROM orders WHERE id = ? AND user_id = ?", [string(order_id), string(uid)]);
+  if (o == null) { return s.err(404, "订单未找到"); }
+  let done = complete_order(req, o, s.str_or(get(req.query_params, "token", ""), ""));
+  if (done != null) { return done; }
+  return null;
+};
+
+// 取消（PayPal 取消 / 放弃）：pending → canceled，购物篮保留
+post "/api/orders/:order_id/cancel", (req) => {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let order_id = as_int(get(req.params, "order_id", 0), 0);
+  let o = db.row("SELECT * FROM orders WHERE id = ? AND user_id = ? AND status = 'pending'", [string(order_id), string(uid)]);
+  if (o == null) { return s.err(404, "未找到待处理订单"); }
+  if (s.str_or(get(o, "paypal_order_id", ""), "") != "") {
+    pp.order_cancel(get(o, "paypal_order_id", ""));
+  }
+  db.exec("UPDATE orders SET status = ? WHERE id = ?", ["canceled", string(order_id)]);
+  return s.ok({ order_id: order_id, status: "canceled" });
+};
+
+get "/api/orders/", (req) => {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let rows = db.q("SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 50", [string(uid)]);
+  let out = [];
+  if (rows != null) { for (r in rows) { push(out, order_obj(r)); } }
+  return s.ok({ orders: out });
+};
+
+get "/api/orders/:order_id", (req) => {
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let order_id = as_int(get(req.params, "order_id", 0), 0);
+  let r = db.row("SELECT * FROM orders WHERE id = ? AND user_id = ?", [string(order_id), string(uid)]);
+  if (r == null) { return s.err(404, "订单未找到"); }
+  return s.ok(order_obj(r));
+};
+
+// ============================================================
+// 管理后台（二期）：订单全量 / 真退款 / 商品上下架·库存 / 概览
+// 对齐原 Oscar dashboard 的演示切片；所有路由 admin 角色门禁。
+// 退款走 pp.refund_capture（真调 PayPal），成功后回补库存 + 订单转 refunded
+// （原项目口径：source 全额退款时 order status 置 Refunded）。
+// ============================================================
+
+func admin_ok(req) {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let f = auth.require_admin(req);
+  if (f != null) { return f; }
+  return null;
+}
+
+func order_admin_obj(r, uname_map) {
+  let o = order_obj(r);
+  // uname_map 传入则批量查好的 {id: username}（列表避免 N+1），否则单独查（详情用）。
+  if (uname_map != null) {
+    o.username = s.str_or(get(uname_map, string(get(r, "user_id", 0)), ""), "");
+  } else {
+    let uname = db.row("SELECT username FROM users WHERE id = ?", [string(get(r, "user_id", 0))]);
+    o.username = uname == null ? "" : s.str_or(get(uname, "username", ""), "");
+  }
+  return o;
+}
+
+get "/api/admin/stats", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let pc = db.row("SELECT COUNT(*) AS n FROM products WHERE displayable = 1", []);
+  let oc = db.row("SELECT COUNT(*) AS n FROM orders WHERE status = 'paid'", []);
+  let gc = db.row("SELECT COALESCE(SUM(total_cents), 0) AS s FROM orders WHERE status = 'paid'", []);
+  let rf = db.row("SELECT COUNT(*) AS n FROM orders WHERE status = 'refunded'", []);
+  let last = db.row("SELECT COUNT(*) AS n FROM orders WHERE created_at >= ?", [string(now() - 30 * 86400)]);
+  let uc = db.row("SELECT COUNT(*) AS n FROM users", []);
+  let rc = db.row("SELECT COUNT(*) AS n FROM reviews WHERE status = 0", []);
+  let vc = db.row("SELECT COUNT(*) AS n FROM vouchers WHERE active = 1", []);
+  // 访问统计：只暴露聚合（总数/时段/路径计数），绝不返回 ip/ua/referrer 明细（无 PII）
+  let vt = db.row("SELECT COUNT(*) AS n FROM visits", []);
+  let v24 = db.row("SELECT COUNT(*) AS n FROM visits WHERE created >= ?", [string(now() - 86400)]);
+  let v7 = db.row("SELECT COUNT(*) AS n FROM visits WHERE created >= ?", [string(now() - 7 * 86400)]);
+  let vp = db.q("SELECT path, COUNT(*) AS n FROM visits WHERE created >= ? GROUP BY path ORDER BY n DESC LIMIT 5", [string(now() - 7 * 86400)]);
+  let top_paths = [];
+  if (vp != null) {
+    for (p in vp) { push(top_paths, { path: s.str_or(get(p, "path", ""), ""), n: as_int(get(p, "n", 0), 0) }); }
+  }
+  return s.ok({
+    users: as_int(get(uc, "n", 0), 0),
+    reviews_pending: as_int(get(rc, "n", 0), 0),
+    vouchers_active: as_int(get(vc, "n", 0), 0),
+    products_visible: as_int(get(pc, "n", 0), 0),
+    orders_paid: as_int(get(oc, "n", 0), 0),
+    gross_cents: as_int(get(gc, "s", 0), 0),
+    gross: as_int(get(gc, "s", 0), 0) / 100.0,
+    orders_refunded: as_int(get(rf, "n", 0), 0),
+    orders_last_30d: as_int(get(last, "n", 0), 0),
+    visits_total: as_int(get(vt, "n", 0), 0),
+    visits_24h: as_int(get(v24, "n", 0), 0),
+    visits_7d: as_int(get(v7, "n", 0), 0),
+    top_paths: top_paths
+  });
+};
+
+func admin_orders(req) {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let status = s.str_or(get(req.query_params, "status", ""), "");
+  let limit = s.q_int(req, "limit", 20);
+  if (limit < 1) { limit = 20; }
+  if (limit > 100) { limit = 100; }
+  let skip = s.q_int(req, "skip", 0);
+  if (skip < 0) { skip = 0; }
+
+  let sql = "SELECT o.* FROM orders o";
+  let params = [];
+  if (len(status) > 0) {
+    if (not (status == "pending" or status == "paid" or status == "failed" or status == "canceled" or status == "refunded")) {
+      return s.err(422, "status 非法");
+    }
+    sql = sql + " WHERE o.status = ?";
+    push(params, status);
+  }
+  sql = sql + " ORDER BY o.id DESC LIMIT ? OFFSET ?";
+  push(params, string(limit));
+  push(params, string(skip));
+  let rows = db.q(sql, params);
+  let out = [];
+  if (rows != null) {
+    // 批量取 username，避免每单一次 users 查询（N+1 → 2 次）。
+    // 不去重：IN 里重复 id 无害；用 put 写 map（lume 不支持 map[expr]=）。
+    let umap = {};
+    let marks = [];
+    let uparams = [];
+    for (r in rows) {
+      let uid = string(get(r, "user_id", 0));
+      if (len(uid) > 0) { push(marks, "?"); push(uparams, uid); }
+    }
+    if (len(marks) > 0) {
+      let us = db.q("SELECT id, username FROM users WHERE id IN (" + join(marks, ",") + ")", uparams);
+      if (us != null) { for (u in us) { put(umap, string(get(u, "id", 0)), get(u, "username", "")); } }
+    }
+    for (r in rows) { push(out, order_admin_obj(r, umap)); }
+  }
+  return s.ok({ orders: out });
+}
+
+get "/api/admin/orders", admin_orders;
+// 前端历史调用带尾斜杠，两个形态都接受，避免 422
+get "/api/admin/orders/", admin_orders;
+
+// CSV 字段转义：含逗号/引号/换行时用双引号包裹，内部引号翻倍。
+func csv_field(v) {
+  let s = str(v);
+  if (s == "null") { s = ""; }
+  if (contains(s, ",") or contains(s, "\"") or contains(s, "\n") or contains(s, "\r")) {
+    s = "\"" + replace(s, "\"", "\"\"") + "\"";
+  }
+  return s;
+}
+
+// 管理端订单导出（admin-only）：CSV（UTF-8 BOM，Excel 友好）。
+// 字段与 admin 列表/详情同级别（username/guest_email 等 admin 本就可见，无新增 PII 面）。
+get "/api/admin/orders/export", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let status = s.str_or(get(req.query_params, "status", ""), "");
+  let sql = "SELECT * FROM orders";
+  let params = [];
+  if (len(status) > 0) {
+    if (not (status == "pending" or status == "paid" or status == "failed" or status == "canceled" or status == "refunded")) {
+      return s.err(422, "status 非法");
+    }
+    sql = sql + " WHERE status = ?";
+    push(params, status);
+  }
+  sql = sql + " ORDER BY id DESC LIMIT 10000";
+  let rows = db.q(sql, params);
+  // 批量取 username（避免 N+1）
+  let umap = {};
+  let marks = [];
+  let uparams = [];
+  if (rows != null) {
+    for (r in rows) {
+      let uid = string(get(r, "user_id", 0));
+      if (len(uid) > 0) { push(marks, "?"); push(uparams, uid); }
+    }
+    if (len(marks) > 0) {
+      let us = db.q("SELECT id, username FROM users WHERE id IN (" + join(marks, ",") + ")", uparams);
+      if (us != null) { for (u in us) { put(umap, string(get(u, "id", 0)), get(u, "username", "")); } }
+    }
+  }
+  let head = ["order_no","status","username","guest_email","total","currency","item_count","discount_cents","refunded_cents","created_at","paid_at","voucher_code"];
+  let lines = [];
+  let hline = [];
+  for (h in head) { push(hline, csv_field(h)); }
+  push(lines, join(hline, ","));
+  if (rows != null) {
+    for (r in rows) {
+      let cents = as_int(get(r, "total_cents", 0), 0);
+      let cell = [s.str_or(get(r, "order_no", ""), ""),
+                  s.str_or(get(r, "status", ""), ""),
+                  s.str_or(get(umap, string(get(r, "user_id", 0)), ""), ""),
+                  s.str_or(get(r, "guest_email", ""), ""),
+                  string(cents / 100.0),
+                  s.str_or(get(r, "currency", "USD"), "USD"),
+                  string(as_int(get(r, "item_count", 0), 0)),
+                  string(as_int(get(r, "discount_cents", 0), 0)),
+                  string(as_int(get(r, "refunded_cents", 0), 0)),
+                  s.str_or(s.iso_or_null(get(r, "created_at", null)), ""),
+                  s.str_or(s.iso_or_null(get(r, "paid_at", null)), ""),
+                  s.str_or(get(r, "voucher_code", ""), "")];
+      let c = [];
+      for (v in cell) { push(c, csv_field(v)); }
+      push(lines, join(c, ","));
+    }
+  }
+  let csv = join(lines, "\n") + "\n";
+  return { status: 200, type: "text/csv; charset=utf-8", body: csv,
+           headers: { "Content-Disposition": "attachment; filename=\"orders.csv\"", "Cache-Control": "no-store" } };
+};
+
+get "/api/admin/orders/:order_id", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let order_id = as_int(get(req.params, "order_id", 0), 0);
+  if (order_id <= 0) { return s.err(422, "order_id 非法"); }
+  let r = db.row("SELECT * FROM orders WHERE id = ?", [string(order_id)]);
+  if (r == null) { return s.err(404, "订单未找到"); }
+  return s.ok(order_admin_obj(r, null));
+};
+
+// 退款：真调 PayPal（capture_id 必须存在）→ 累计 refunded_cents → 全额时回补库存 + 订单转 refunded。
+// 对齐 Django dashboard：可省略 amount_cents（全额）或传整数分（部分退款），
+// 部分退款时订单保持 paid，直到累计退满。幂等两层：
+//   1) 本地按 key 去重（重复请求 200 already，不重复记账）
+//   2) PayPal 侧同 capture + 同金额用稳定 Request-Id，命中原退款
+post "/api/admin/orders/:order_id/refund", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let order_id = as_int(get(req.params, "order_id", 0), 0);
+  let o = db.row("SELECT * FROM orders WHERE id = ?", [string(order_id)]);
+  if (o == null) { return s.err(404, "订单未找到"); }
+  let status = s.str_or(get(o, "status", ""), "");
+  let total = as_int(get(o, "total_cents", 0), 0);
+  let already = as_int(get(o, "refunded_cents", 0), 0);
+  let cur = s.str_or(get(o, "currency", currency), currency);
+
+  if (status == "refunded") {
+    return s.ok({ order_id: order_id, status: "refunded", already: true, refunded_cents: total });
+  }
+  if (status != "paid") {
+    return s.err(400, "订单状态 " + status + " 不可退款（仅 paid 可退）");
+  }
+  let cap = s.str_or(get(o, "paypal_capture_id", ""), "");
+  if (len(cap) == 0) {
+    return s.err(400, "订单缺少 PayPal capture id，无法退款");
+  }
+
+  let b = s.parse_body(req);
+  if (b == null) { b = {}; }
+  let amount = as_int(get(b, "amount_cents", total - already), total - already);
+  if (amount <= 0 or amount > total - already) {
+    return s.err(400, "退款金额须在 1.." + string(total - already) + " 分之间");
+  }
+  let given_key = s.str_or(get(b, "key", ""), "");
+  let refund_key = len(given_key) > 0 ? given_key : "refund-" + string(order_id) + "-" + string(amount);
+  let parsed = try(() => json(s.str_or(get(o, "refunds_json", "[]"), "[]")));
+  let refunds = get(parsed, "ok", []);
+  let i = 0;
+  while (i < len(refunds)) {
+    let rec = get(refunds, i, {});
+    if (s.str_or(get(rec, "key", ""), "") == refund_key) {
+      return s.ok({ order_id: order_id, status: status, already: true,
+                    refunded_cents: already, refund_id: get(rec, "refund_id", "") });
+    }
+    i = i + 1;
+  }
+
+  let note = s.str_or(get(b, "note", "admin demo refund"), "admin demo refund");
+  let pp_fail = pp.refund_capture(cap, amount, cur, note, refund_key);
+  if (pp_fail != null) { return pp_fail; }
+  let st = pp.last_state();
+  let new_refunded = already + amount;
+  push(refunds, {
+    key: refund_key, refund_id: st.refund_id, refund_status: st.refund_status,
+    amount_cents: amount, currency: cur, created_at: now()
+  });
+  db.exec("UPDATE orders SET refunded_cents = ?, refunds_json = ? WHERE id = ?",
+          [string(new_refunded), stringify(refunds), string(order_id)]);
+
+  if (new_refunded < total) {
+    return s.ok({ order_id: order_id, status: "paid", partial: true,
+                  refunded_cents: new_refunded, remaining_cents: total - new_refunded,
+                  refund_id: st.refund_id, capture_id: cap });
+  }
+
+  // 全额退完才回补库存（对齐原项目 only fully refunded → order Refunded）
+  let items = try(() => json(get(o, "items_json", "[]")));
+  let plist = get(items, "ok", []);
+  let j = 0;
+  while (j < len(plist)) {
+    let it = get(plist, j, {});
+    let pid = as_int(get(it, "product_id", 0), 0);
+    let qty = as_int(get(it, "quantity", 0), 0);
+    // 原子回补（单语句，避免读-改-写丢更新）
+    if (pid > 0 and qty > 0) {
+      db.exec("UPDATE products SET stock = stock + ? WHERE id = ?", [string(qty), string(pid)]);
+    }
+    j = j + 1;
+  }
+  db.exec("UPDATE orders SET status = ? WHERE id = ?", ["refunded", string(order_id)]);
+  return s.ok({ order_id: order_id, status: "refunded", refunded_cents: new_refunded,
+                refund_id: st.refund_id, capture_id: cap });
+};
+
+// 商品管理：列表（含未上架）
+get "/api/admin/products", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT * FROM products ORDER BY name LIMIT 500");
+  let out = [];
+  if (rows != null) { for (r in rows) { push(out, product_obj(r)); } }
+  return s.ok({ products: out });
+};
+
+// 管理端商品导出（admin-only）：CSV（复用 csv_field；字段同 admin 列表）。
+get "/api/admin/products/export", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT * FROM products ORDER BY name LIMIT 10000");
+  let head = ["sku","name","category","category_path","price","stock","image","displayable","created_at"];
+  let lines = [];
+  let hline = [];
+  for (h in head) { push(hline, csv_field(h)); }
+  push(lines, join(hline, ","));
+  if (rows != null) {
+    for (r in rows) {
+      let cents = as_int(get(r, "price_cents", 0), 0);
+      let cell = [s.str_or(get(r, "sku", ""), ""),
+                  s.str_or(get(r, "name", ""), ""),
+                  s.str_or(get(r, "category", ""), ""),
+                  s.str_or(get(r, "category_path", ""), ""),
+                  string(cents / 100.0),
+                  string(as_int(get(r, "stock", 0), 0)),
+                  s.str_or(get(r, "image", ""), ""),
+                  string(as_int(get(r, "displayable", 1), 1)),
+                  s.str_or(s.iso_or_null(get(r, "created_at", null)), "")];
+      let c = [];
+      for (v in cell) { push(c, csv_field(v)); }
+      push(lines, join(c, ","));
+    }
+  }
+  let csv = join(lines, "\n") + "\n";
+  return { status: 200, type: "text/csv; charset=utf-8", body: csv,
+           headers: { "Content-Disposition": "attachment; filename=\"products.csv\"", "Cache-Control": "no-store" } };
+};
+
+// 商品上下架 / 库存 / 价格：PATCH {displayable?, stock?, price_cents?}
+patch "/api/admin/products/:product_id", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let pid = as_int(get(req.params, "product_id", 0), 0);
+  if (pid <= 0) { return s.err(422, "product_id 非法"); }
+  let p = db.row("SELECT * FROM products WHERE id = ?", [string(pid)]);
+  if (p == null) { return s.err(404, "商品未找到"); }
+
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+
+  let cur_disp = as_int(get(p, "displayable", 1), 1);
+  let cur_stock = as_int(get(p, "stock", 0), 0);
+  let cur_price = as_int(get(p, "price_cents", 0), 0);
+  let dv = get(b, "displayable", null);
+  let sv = get(b, "stock", null);
+  let pv = get(b, "price_cents", null);
+  let disp = dv == null ? cur_disp : as_int(dv, cur_disp);
+  let stock = sv == null ? cur_stock : as_int(sv, cur_stock);
+  let price = pv == null ? cur_price : as_int(pv, cur_price);
+  if (disp != 0 and disp != 1) { return s.err(422, "displayable 需为 0/1"); }
+  if (stock < 0) { return s.err(422, "stock 不能为负"); }
+  if (price < 0) { return s.err(422, "price_cents 不能为负"); }
+
+  db.exec("UPDATE products SET displayable = ?, stock = ?, price_cents = ? WHERE id = ?",
+          [string(disp), string(stock), string(price), string(pid)]);
+  let r = db.row("SELECT * FROM products WHERE id = ?", [string(pid)]);
+  return s.ok(product_obj(r));
+};
+
+// ============================================================
+// 账户扩展（对齐 Oscar customer）：注册 / 演示口令找回 / 地址簿 / 订单追踪
+// ============================================================
+
+func req_uid(req) {
+  let sess = auth.session(req);
+  if (sess == null) { return 0; }
+  let u = db.row("SELECT id FROM users WHERE username = ?", [get(sess, "user", "")]);
+  if (u == null) { return 0; }
+  return as_int(get(u, "id", 0), 0);
+}
+
+func valid_email(v) {
+  let e = lower(trim(v));
+  if (len(e) < 5 or len(e) > 120) { return false; }
+  if (contains(e, " ") or contains(e, "\t")) { return false; }
+  let at = 0;
+  let i = 0;
+  while (i < len(e)) {
+    if (substr(e, i, 1) == "@") { at = at + 1; }
+    i = i + 1;
+  }
+  if (at != 1 or starts_with(e, "@") or ends_with(e, "@")) { return false; }
+  let tail = substr(e, len(e) - 4, 4);
+  return contains(e, ".") and len(tail) >= 2;
+}
+
+func valid_new_username(v) {
+  let n = lower(trim(v));
+  if (len(n) < 3 or len(n) > 32) { return false; }
+  let allowed = "abcdefghijklmnopqrstuvwxyz0123456789_-";
+  let i = 0;
+  while (i < len(n)) {
+    if (not contains(allowed, substr(n, i, 1))) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// 注册成功自动登录，对齐 Oscar RegisterUserMixin.register_user
+post "/auth/register", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let username = lower(trim(s.str_or(get(b, "username", ""), "")));
+  let email = lower(trim(s.str_or(get(b, "email", ""), "")));
+  let pass = s.str_or(get(b, "password", ""), "");
+  let pass2 = s.str_or(get(b, "password2", pass), pass);
+  if (not valid_new_username(username)) { return s.err(422, "用户名需 3-32 位，限小写字母/数字/_-"); }
+  if (not valid_email(email)) { return s.err(422, "邮箱格式不正确"); }
+  if (len(pass) < 9 or pass != pass2) { return s.err(422, "口令至少 9 位且两次输入一致"); }
+  if (auth.user_by_name(username) != null) { return s.err(409, "用户名已存在"); }
+  let by_email = db.row("SELECT id FROM users WHERE lower(email) = ?", [email]);
+  if (by_email != null) { return s.err(409, "邮箱已注册"); }
+
+  auth.create_user(username, pass, "customer");
+  db.exec("UPDATE users SET email = ? WHERE username = ?", [email, username]);
+  let token = auth.issue_token(username);
+  return s.json_res(201, {
+    username: username, email: email, role: "customer",
+    access_token: token, token_type: "bearer"
+  }, { "Set-Cookie": auth.cookie_header(token) });
+};
+
+// 演示环境没有邮件服务（Oscar sandbox 用 console backend），这里直接把 token
+// 返回给调用方，便于 E2E/人工走完重置流程；production 下不返回 token。
+post "/auth/password-reset/request", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let email = lower(trim(s.str_or(get(b, "email", ""), "")));
+  // per-email 节流：防分布式攻击者轰炸特定邮箱（per-IP 5/15min 之外的第二道）；
+  // 短窗口（默认 3/300s）绑定 DoS 上限——单人不会 5 分钟内 3 次请求重置。
+  if (len(email) > 0) {
+    let rt = s.rate_take("resetemail|" + email,
+                         int(s.env_or("RATE_LIMIT_RESET_EMAIL_REQUESTS", "3")),
+                         int(s.env_or("RATE_LIMIT_RESET_EMAIL_WINDOW", "300")));
+    if (get(rt, "over", false)) {
+      return s.err(429, "重置请求过于频繁，请稍后再试");
+    }
+  }
+  let u = db.row("SELECT id, username FROM users WHERE lower(email) = ?", [email]);
+  let out = { message: "如果该邮箱已注册，重置链接已生成" };
+  if (u != null) {
+    let uid = as_int(get(u, "id", 0), 0);
+    db.exec("DELETE FROM password_resets WHERE user_id = ?", [string(uid)]);
+    let uname = s.str_or(get(u, "username", ""), "");
+    // 返回给用户的明文 token 只在响应/邮件出现一次；库里只存它的 HMAC 哈希，
+    // 库泄露不会直接暴露可用重置 token（对齐最佳实践：token 落库必须哈希）。
+    let token = substr(hmac_sha256(auth.secret(), "reset:" + uname + ":" + string(now())), 0, 32);
+    let token_hash = hmac_sha256(auth.secret(), "resethash:" + token);
+    db.exec("INSERT INTO password_resets (user_id, token, created_at) VALUES (?,?,?)",
+            [string(uid), token_hash, string(now())]);
+    if (s.env_or("APP_ENV", "development") != "production") {
+      put(out, "demo_token", token);
+      put(out, "demo_url", "/#/reset?token=" + token);
+    }
+  }
+  return s.ok(out);
+};
+
+post "/auth/password-reset/confirm", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let token = s.str_or(get(b, "token", ""), "");
+  let pass = s.str_or(get(b, "password", ""), "");
+  if (len(pass) < 9) { return s.err(422, "口令至少 9 位"); }
+  // 库里存的是 token 哈希（见 /auth/password-reset/request），这里同样哈希后查找。
+  let token_hash = hmac_sha256(auth.secret(), "resethash:" + token);
+  let rec = db.row("SELECT * FROM password_resets WHERE token = ?", [token_hash]);
+  if (rec == null or get(rec, "used_at", null) != null) { return s.err(400, "重置链接无效或已使用"); }
+  if (as_int(get(rec, "created_at", 0), 0) + 3600 < now()) { return s.err(400, "重置链接已过期"); }
+  let u = db.row("SELECT username FROM users WHERE id = ?", [string(get(rec, "user_id", 0))]);
+  if (u == null) { return s.err(400, "重置链接无效"); }
+  let uname = s.str_or(get(u, "username", ""), "");
+  db.exec("UPDATE users SET password_hash = ? WHERE id = ?", [auth.hash_password(pass, uname), string(get(rec, "user_id", 0))]);
+  db.exec("UPDATE password_resets SET used_at = ? WHERE id = ?", [string(now()), string(get(rec, "id", 0))]);
+  return s.ok({ message: "口令已重置，请重新登录" });
+};
+
+func address_obj(r) {
+  if (r == null) { return null; }
+  return {
+    id: as_int(get(r, "id", 0), 0),
+    first_name: s.str_or(get(r, "first_name", ""), ""),
+    last_name: s.str_or(get(r, "last_name", ""), ""),
+    line1: s.str_or(get(r, "line1", ""), ""),
+    line2: get(r, "line2", null),
+    line3: get(r, "line3", null),
+    city: s.str_or(get(r, "city", ""), ""),
+    state: get(r, "state", null),
+    postcode: s.str_or(get(r, "postcode", ""), ""),
+    country: s.str_or(get(r, "country", "CN"), "CN"),
+    phone: get(r, "phone", null),
+    notes: get(r, "notes", null),
+    is_default_shipping: as_int(get(r, "is_default_shipping", 0), 0) != 0,
+    is_default_billing: as_int(get(r, "is_default_billing", 0), 0) != 0
+  };
+}
+
+func clear_addr_defaults(uid, aid, kind) {
+  if (kind == "shipping") {
+    db.exec("UPDATE user_addresses SET is_default_shipping = 0 WHERE user_id = ? AND id != ?", [string(uid), string(aid)]);
+  } else {
+    db.exec("UPDATE user_addresses SET is_default_billing = 0 WHERE user_id = ? AND id != ?", [string(uid), string(aid)]);
+  }
+}
+
+get "/api/addresses/", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = req_uid(req);
+  if (uid == 0) { return auth.require_login(req); }
+  let rows = db.q("SELECT * FROM user_addresses WHERE user_id = ? ORDER BY is_default_shipping DESC, id DESC", [string(uid)]);
+  let out = [];
+  if (rows != null) { for (r in rows) { push(out, address_obj(r)); } }
+  return s.ok({ addresses: out });
+};
+
+post "/api/addresses/", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = req_uid(req);
+  if (uid == 0) { return auth.require_login(req); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let first = trim(s.str_or(get(b, "first_name", ""), ""));
+  let last = trim(s.str_or(get(b, "last_name", ""), ""));
+  let line1 = trim(s.str_or(get(b, "line1", ""), ""));
+  let city = trim(s.str_or(get(b, "city", ""), ""));
+  let postcode = trim(s.str_or(get(b, "postcode", ""), ""));
+  if (len(first) == 0 or len(last) == 0 or len(line1) == 0 or len(city) == 0 or len(postcode) == 0) {
+    return s.err(422, "姓名/地址/城市/邮编必填");
+  }
+  let def_ship = as_int(get(b, "is_default_shipping", 0), 0) == 1;
+  let def_bill = as_int(get(b, "is_default_billing", 0), 0) == 1;
+  db.exec("INSERT INTO user_addresses (user_id, first_name, last_name, line1, line2, line3, city, state, postcode, country, phone, notes, is_default_shipping, is_default_billing, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          [string(uid), first, last, line1, s.str_or(get(b, "line2", ""), ""), s.str_or(get(b, "line3", ""), ""),
+           city, s.str_or(get(b, "state", ""), ""), upper(postcode), s.str_or(get(b, "country", "CN"), "CN"),
+           s.str_or(get(b, "phone", ""), ""), s.str_or(get(b, "notes", ""), ""),
+           def_ship ? "1" : "0", def_bill ? "1" : "0", string(now())]);
+  let row = db.row("SELECT * FROM user_addresses WHERE user_id = ? ORDER BY id DESC LIMIT 1", [string(uid)]);
+  let aid = as_int(get(row, "id", 0), 0);
+  if (def_ship) { clear_addr_defaults(uid, aid, "shipping"); }
+  if (def_bill) { clear_addr_defaults(uid, aid, "billing"); }
+  return s.created(address_obj(db.row("SELECT * FROM user_addresses WHERE id = ?", [string(aid)])));
+};
+
+patch "/api/addresses/:id", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = req_uid(req);
+  if (uid == 0) { return auth.require_login(req); }
+  let aid = as_int(get(req.params, "id", 0), 0);
+  let old = db.row("SELECT * FROM user_addresses WHERE id = ? AND user_id = ?", [string(aid), string(uid)]);
+  if (old == null) { return s.err(404, "地址未找到"); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let fields = ["first_name", "last_name", "line1", "line2", "line3", "city", "state", "postcode", "country", "phone", "notes"];
+  let vals = [];
+  for (f in fields) {
+    if (get(b, f, null) != null) { push(vals, s.str_or(get(b, f, ""), "")); }
+    else { push(vals, s.str_or(get(old, f, ""), "")); }
+  }
+  let def_ship = as_int(get(b, "is_default_shipping", get(old, "is_default_shipping", 0)), 0) == 1;
+  let def_bill = as_int(get(b, "is_default_billing", get(old, "is_default_billing", 0)), 0) == 1;
+  push(vals, def_ship ? "1" : "0");
+  push(vals, def_bill ? "1" : "0");
+  push(vals, string(aid));
+  db.exec("UPDATE user_addresses SET first_name=?,last_name=?,line1=?,line2=?,line3=?,city=?,state=?,postcode=?,country=?,phone=?,notes=?,is_default_shipping=?,is_default_billing=? WHERE id=?", vals);
+  if (def_ship) { clear_addr_defaults(uid, aid, "shipping"); }
+  if (def_bill) { clear_addr_defaults(uid, aid, "billing"); }
+  return s.ok(address_obj(db.row("SELECT * FROM user_addresses WHERE id = ?", [string(aid)])));
+};
+
+delete "/api/addresses/:id", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = req_uid(req);
+  if (uid == 0) { return auth.require_login(req); }
+  let aid = as_int(get(req.params, "id", 0), 0);
+  let n = db.exec("DELETE FROM user_addresses WHERE id = ? AND user_id = ?", [string(aid), string(uid)]);
+  if (as_int(n, 0) == 0) { return s.err(404, "地址未找到"); }
+  return s.ok({ deleted: true, id: aid });
+};
+
+// 对齐 Oscar address-change-status
+post "/api/addresses/:id/default", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = req_uid(req);
+  if (uid == 0) { return auth.require_login(req); }
+  let aid = as_int(get(req.params, "id", 0), 0);
+  let a = db.row("SELECT * FROM user_addresses WHERE id = ? AND user_id = ?", [string(aid), string(uid)]);
+  if (a == null) { return s.err(404, "地址未找到"); }
+  let b = s.parse_body(req);
+  let kind = b == null ? "shipping" : s.str_or(get(b, "kind", "shipping"), "shipping");
+  if (kind != "shipping" and kind != "billing") { return s.err(422, "kind 需为 shipping/billing"); }
+  if (kind == "shipping") {
+    db.exec("UPDATE user_addresses SET is_default_shipping = 0 WHERE user_id = ?", [string(uid)]);
+    db.exec("UPDATE user_addresses SET is_default_shipping = 1 WHERE id = ?", [string(aid)]);
+  } else {
+    db.exec("UPDATE user_addresses SET is_default_billing = 0 WHERE user_id = ?", [string(uid)]);
+    db.exec("UPDATE user_addresses SET is_default_billing = 1 WHERE id = ?", [string(aid)]);
+  }
+  return s.ok(address_obj(db.row("SELECT * FROM user_addresses WHERE id = ?", [string(aid)])));
+};
+
+// 匿名订单追踪：Oscar 是 order_no + hash + email；演示用 order_no + 下单邮箱。
+post "/api/orders/track", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let order_no = upper(trim(s.str_or(get(b, "order_no", ""), "")));
+  let email = lower(trim(s.str_or(get(b, "email", ""), "")));
+  if (len(order_no) == 0 or not valid_email(email)) { return s.err(422, "订单号与邮箱必填"); }
+  let o = db.row("SELECT * FROM orders WHERE upper(order_no) = ?", [order_no]);
+  if (o == null) { return s.err(404, "订单未找到"); }
+  let guest = lower(trim(s.str_or(get(o, "guest_email", ""), "")));
+  let owner = db.row("SELECT email FROM users WHERE id = ?", [string(get(o, "user_id", 0))]);
+  let owner_email = owner == null ? "" : lower(trim(s.str_or(get(owner, "email", ""), "")));
+  if (guest != email and owner_email != email) { return s.err(404, "订单未找到"); }
+  let v = order_obj(o);
+  return s.ok({
+    order_no: get(v, "order_no", ""), status: get(v, "status", ""),
+    total: get(v, "total", 0), currency: get(v, "currency", "USD"),
+    created_at: get(v, "created_at", null), items: get(v, "items", [])
+  });
+};
+
+// ============================================================
+// 优惠券（对齐 Oscar voucher + basket:vouchers-add/remove）
+// ============================================================
+
+func basket_id_for(uid) {
+  let b = db.row("SELECT id FROM baskets WHERE user_id = ?", [string(uid)]);
+  if (b != null) { return as_int(get(b, "id", 0), 0); }
+  db.exec("INSERT INTO baskets (user_id, updated_at) VALUES (?, ?)", [string(uid), string(now())]);
+  let created = db.row("SELECT id FROM baskets WHERE user_id = ?", [string(uid)]);
+  return as_int(get(created, "id", 0), 0);
+}
+
+// s.ok() 的载荷在 body 字符串里，取字段前要先解回来
+func view_body(view) {
+  let j = try(() => json(s.str_or(get(view, "body", "{}"), "{}")));
+  return get(j, "ok", {});
+}
+
+post "/api/basket/voucher", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let code = upper(trim(s.str_or(get(b, "code", ""), "")));
+  if (len(code) == 0) { return s.err(422, "券码必填"); }
+  let v = db.row("SELECT * FROM vouchers WHERE upper(code) = ?", [code]);
+  if (v == null) { return s.err(404, "券码不存在"); }
+  let start = get(v, "start_at", null);
+  let end = get(v, "end_at", null);
+  if (as_int(get(v, "active", 0), 0) != 1 or (start != null and as_int(start, 0) > now()) or
+      (end != null and as_int(end, 0) < now())) {
+    return s.err(400, "券码不可用");
+  }
+  let limit = as_int(get(v, "usage_limit", 0), 0);
+  if (limit > 0 and as_int(get(v, "num_orders", 0), 0) >= limit) { return s.err(400, "券码已用完"); }
+  let b_id = basket_id_for(uid);
+  let vid = as_int(get(v, "id", 0), 0);
+  db.exec("DELETE FROM basket_vouchers WHERE basket_id = ?", [string(b_id)]); // 演示：一篮一券
+  db.exec("INSERT INTO basket_vouchers (basket_id, voucher_id, created_at) VALUES (?,?,?)",
+          [string(b_id), string(vid), string(now())]);
+  let body = view_body(basket_view(req));
+  if (as_int(get(body, "discount_cents", 0), 0) <= 0) {
+    db.exec("DELETE FROM basket_vouchers WHERE basket_id = ?", [string(b_id)]);
+    return s.err(400, "购物篮未满足该券的折扣条件");
+  }
+  return s.ok({
+    message: "券已应用",
+    code: code,
+    discount_cents: get(body, "discount_cents", 0),
+    subtotal_cents: get(body, "subtotal_cents", 0),
+    total_cents: get(body, "total_cents", 0)
+  });
+};
+
+// （移除券的路由已提前注册，见 basket_add 后；此处只保留参数路由）
+
+// ============================================================
+// 愿望单（对齐 Oscar wishlists：默认列表 + 行，未登录禁用）
+// ============================================================
+
+func user_wishlist(uid) {
+  let w = db.row("SELECT * FROM wishlists WHERE user_id = ? ORDER BY id LIMIT 1", [string(uid)]);
+  if (w != null) { return w; }
+  let key = substr(hmac_sha256(auth.secret(), "wish:" + string(uid) + ":" + string(now())), 0, 6);
+  db.exec("INSERT INTO wishlists (user_id, name, visibility, share_key, created_at) VALUES (?,?,?,?,?)",
+          [string(uid), "Default", "PRIVATE", key, string(now())]);
+  return db.row("SELECT * FROM wishlists WHERE user_id = ? ORDER BY id LIMIT 1", [string(uid)]);
+}
+
+func wishlist_obj(w) {
+  if (w == null) { return { items: [], share_key: "" }; }
+  let rows = db.q("SELECT wl.product_id, wl.quantity, p.sku, p.slug, p.name, p.price_cents, p.stock, p.image " +
+                  "FROM wishlist_lines wl JOIN products p ON p.id = wl.product_id WHERE wl.wishlist_id = ? ORDER BY p.name",
+                  [string(get(w, "id", 0))]);
+  let items = [];
+  if (rows != null) {
+    for (r in rows) {
+      push(items, {
+        product_id: as_int(get(r, "product_id", 0), 0),
+        sku: s.str_or(get(r, "sku", ""), ""),
+        slug: s.str_or(get(r, "slug", ""), ""),
+        name: s.str_or(get(r, "name", ""), ""),
+        price: as_int(get(r, "price_cents", 0), 0) / 100.0,
+        price_cents: as_int(get(r, "price_cents", 0), 0),
+        stock: as_int(get(r, "stock", 0), 0),
+        image: get(r, "image", null),
+        quantity: as_int(get(r, "quantity", 0), 0)
+      });
+    }
+  }
+  return { name: s.str_or(get(w, "name", "Default"), "Default"), share_key: s.str_or(get(w, "share_key", ""), ""), items: items };
+}
+
+get "/api/wishlist/", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = req_uid(req);
+  if (uid == 0) { return auth.require_login(req); }
+  return s.ok(wishlist_obj(user_wishlist(uid)));
+};
+
+post "/api/wishlist/", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = req_uid(req);
+  if (uid == 0) { return auth.require_login(req); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let pid = as_int(get(b, "product_id", 0), 0);
+  let qty = as_int(get(b, "quantity", 1), 1);
+  if (pid <= 0 or qty <= 0) { return s.err(422, "product_id/quantity 非法"); }
+  let p = db.row("SELECT id FROM products WHERE id = ? AND displayable = 1", [string(pid)]);
+  if (p == null) { return s.err(404, "商品未找到"); }
+  let w = user_wishlist(uid);
+  let wid = as_int(get(w, "id", 0), 0);
+  let line = db.row("SELECT id, quantity FROM wishlist_lines WHERE wishlist_id = ? AND product_id = ?", [string(wid), string(pid)]);
+  if (line == null) {
+    db.exec("INSERT INTO wishlist_lines (wishlist_id, product_id, quantity, created_at) VALUES (?,?,?,?)",
+            [string(wid), string(pid), string(qty), string(now())]);
+  } else {
+    db.exec("UPDATE wishlist_lines SET quantity = ? WHERE id = ?",
+            [string(as_int(get(line, "quantity", 0), 0) + qty), string(get(line, "id", 0))]);
+  }
+  return s.created(wishlist_obj(w));
+};
+
+delete "/api/wishlist/:product_id", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = req_uid(req);
+  if (uid == 0) { return auth.require_login(req); }
+  let pid = as_int(get(req.params, "product_id", 0), 0);
+  let w = user_wishlist(uid);
+  db.exec("DELETE FROM wishlist_lines WHERE wishlist_id = ? AND product_id = ?", [string(get(w, "id", 0)), string(pid)]);
+  return s.ok(wishlist_obj(w));
+};
+
+// lume 扩展：愿望单直接加购（Oscar 原生需回到商品页加购）
+post "/api/wishlist/:product_id/move-to-basket", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let uid = basket_user_id(req);
+  if (uid == null) { return auth.require_login(req); }
+  let pid = as_int(get(req.params, "product_id", 0), 0);
+  let w = user_wishlist(uid);
+  let line = db.row("SELECT quantity FROM wishlist_lines WHERE wishlist_id = ? AND product_id = ?", [string(get(w, "id", 0)), string(pid)]);
+  if (line == null) { return s.err(404, "愿望单中没有该商品"); }
+  let b_id = basket_id_for(uid);
+  let qty = as_int(get(line, "quantity", 1), 1);
+  let old = db.row("SELECT quantity FROM basket_items WHERE basket_id = ? AND product_id = ?", [string(b_id), string(pid)]);
+  if (old == null) {
+    db.exec("INSERT INTO basket_items (basket_id, product_id, quantity) VALUES (?,?,?)", [string(b_id), string(pid), string(qty)]);
+  } else {
+    db.exec("UPDATE basket_items SET quantity = ? WHERE basket_id = ? AND product_id = ?",
+            [string(as_int(get(old, "quantity", 0), 0) + qty), string(b_id), string(pid)]);
+  }
+  return s.ok({ moved: true, product_id: pid, quantity: qty });
+};
+
+// ============================================================
+// 商品评价（对齐 Oscar reviews：默认免审核，登录用户唯一，匿名可填 name/email）
+// ============================================================
+
+func review_obj(r) {
+  if (r == null) { return null; }
+  return {
+    id: as_int(get(r, "id", 0), 0),
+    score: as_int(get(r, "score", 0), 0),
+    title: s.str_or(get(r, "title", ""), ""),
+    body: get(r, "body", null),
+    author: len(s.str_or(get(r, "name", ""), "")) > 0 ? s.str_or(get(r, "name", ""), "") : "",
+    created_at: s.iso_or_null(get(r, "created_at", null)),
+    status: as_int(get(r, "status", 1), 1)
+  };
+}
+
+get "/api/products/:slug/reviews", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let slug = s.str_or(get(req.params, "slug", ""), "");
+  let p = db.row("SELECT id FROM products WHERE slug = ?", [slug]);
+  if (p == null) { return s.err(404, "商品未找到"); }
+  let rows = db.q("SELECT r.*, u.username FROM reviews r LEFT JOIN users u ON u.id = r.user_id " +
+                  "WHERE r.product_id = ? AND r.status = 1 ORDER BY r.id DESC LIMIT 100", [string(get(p, "id", 0))]);
+  let out = [];
+  if (rows != null) { for (r in rows) { push(out, review_obj(r)); } }
+  return s.ok({ reviews: out });
+};
+
+post "/api/products/:slug/reviews", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let slug = s.str_or(get(req.params, "slug", ""), "");
+  let p = db.row("SELECT id FROM products WHERE slug = ?", [slug]);
+  if (p == null) { return s.err(404, "商品未找到"); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let uid = req_uid(req);
+  let title = trim(s.str_or(get(b, "title", ""), ""));
+  let score = as_int(get(b, "score", 0), 0);
+  if (len(title) == 0 or score < 1 or score > 5) { return s.err(422, "标题必填，评分 1-5"); }
+  let name = trim(s.str_or(get(b, "name", ""), ""));
+  let email = lower(trim(s.str_or(get(b, "email", ""), "")));
+  if (uid == 0 and (len(name) == 0 or not valid_email(email))) { return s.err(422, "匿名评价需填姓名和邮箱"); }
+  if (uid > 0) {
+    let dup = db.row("SELECT id FROM reviews WHERE product_id = ? AND user_id = ?", [string(get(p, "id", 0)), string(uid)]);
+    if (dup != null) { return s.err(409, "每个商品只能评价一次"); }
+  } else {
+    let dup2 = db.row("SELECT id FROM reviews WHERE product_id = ? AND lower(email) = ?", [string(get(p, "id", 0)), email]);
+    if (dup2 != null) { return s.err(409, "该邮箱已评价过此商品"); }
+  }
+  let author = name;
+  if (len(author) == 0 and uid > 0) {
+    let u = db.row("SELECT username FROM users WHERE id = ?", [string(uid)]);
+    author = u == null ? "" : s.str_or(get(u, "username", ""), "");
+  }
+  db.exec("INSERT INTO reviews (product_id, user_id, name, email, title, body, score, status, created_at) VALUES (?,?,?,?,?,?,?,1,?)",
+          [string(get(p, "id", 0)), uid == 0 ? null : string(uid), author, email, title,
+           s.str_or(get(b, "body", ""), ""), string(score), string(now())]);
+  let row = db.row("SELECT r.*, u.username FROM reviews r LEFT JOIN users u ON u.id = r.user_id ORDER BY r.id DESC LIMIT 1", []);
+  return s.created(review_obj(row));
+};
+
+// ============================================================
+// 内容页（对齐 Oscar flatpage /about/）
+// ============================================================
+
+get "/api/pages/", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT url, title, registration_required FROM flatpages ORDER BY url");
+  let out = [];
+  if (rows != null) { for (r in rows) { push(out, {
+    url: s.str_or(get(r, "url", ""), ""), title: s.str_or(get(r, "title", ""), ""),
+    registration_required: as_int(get(r, "registration_required", 0), 0) != 0
+  }); } }
+  // 内容页列表变更极少（仅 admin 增删），1h 缓存。
+  return s.json_res(200, { pages: out }, { "Cache-Control": "public, max-age=3600" });
+};
+
+get "/api/pages/:slug", (req) => {
+  let g = s.guard(req);
+  if (g != null) { return g; }
+  let slug = s.str_or(get(req.params, "slug", ""), "");
+  let url = "/" + slug + "/";
+  let p = db.row("SELECT * FROM flatpages WHERE url = ? OR url = ?", [url, "/" + slug]);
+  if (p == null) { return s.err(404, "页面未找到"); }
+  return s.ok({
+    url: s.str_or(get(p, "url", ""), ""),
+    title: s.str_or(get(p, "title", ""), ""),
+    content: get(p, "content", ""),
+    registration_required: as_int(get(p, "registration_required", 0), 0) != 0
+  });
+};
+
+// ============================================================
+// 后台扩展（Oscar dashboard 演示切片）：用户 / 券 / 评价 / 内容页 / 报表
+// ============================================================
+
+get "/api/admin/users", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT id, username, email, role, created_at FROM users ORDER BY id LIMIT 500");
+  let out = [];
+  if (rows != null) { for (r in rows) { push(out, {
+    id: as_int(get(r, "id", 0), 0), username: s.str_or(get(r, "username", ""), ""),
+    email: get(r, "email", null), role: s.str_or(get(r, "role", "customer"), "customer"),
+    created_at: s.iso_or_null(get(r, "created_at", null))
+  }); } }
+  return s.ok({ users: out });
+};
+
+patch "/api/admin/users/:id", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let id = as_int(get(req.params, "id", 0), 0);
+  let u = db.row("SELECT id FROM users WHERE id = ?", [string(id)]);
+  if (u == null) { return s.err(404, "用户未找到"); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let role = s.str_or(get(b, "role", ""), "");
+  if (role != "customer" and role != "admin") { return s.err(422, "role 需为 customer/admin"); }
+  db.exec("UPDATE users SET role = ? WHERE id = ?", [role, string(id)]);
+  return s.ok({ id: id, role: role });
+};
+
+get "/api/admin/vouchers", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT * FROM vouchers ORDER BY id LIMIT 200");
+  let out = [];
+  if (rows != null) { for (r in rows) { push(out, {
+    id: as_int(get(r, "id", 0), 0), code: s.str_or(get(r, "code", ""), ""),
+    name: s.str_or(get(r, "name", ""), ""), discount_type: s.str_or(get(r, "discount_type", ""), ""),
+    value: as_int(get(r, "value", 0), 0), min_subtotal_cents: as_int(get(r, "min_subtotal_cents", 0), 0),
+    max_discount_cents: as_int(get(r, "max_discount_cents", 0), 0),
+    usage_limit: as_int(get(r, "usage_limit", 0), 0), num_orders: as_int(get(r, "num_orders", 0), 0),
+    active: as_int(get(r, "active", 0), 0) != 0
+  }); } }
+  return s.ok({ vouchers: out });
+};
+
+post "/api/admin/vouchers", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let code = upper(trim(s.str_or(get(b, "code", ""), "")));
+  let dtype = s.str_or(get(b, "discount_type", "percentage"), "percentage");
+  let value = as_int(get(b, "value", 0), 0);
+  if (len(code) == 0 or value <= 0) { return s.err(422, "券码与折扣值必填"); }
+  if (dtype != "percentage" and dtype != "absolute") { return s.err(422, "discount_type 非法"); }
+  if (dtype == "percentage" and value > 100) { return s.err(422, "百分比不能超过 100"); }
+  if (db.row("SELECT id FROM vouchers WHERE upper(code) = ?", [code]) != null) { return s.err(409, "券码已存在"); }
+  db.exec("INSERT INTO vouchers (code, name, discount_type, value, min_subtotal_cents, max_discount_cents, usage_limit, active, created_at) VALUES (?,?,?,?,?,?,?,1,?)",
+          [code, s.str_or(get(b, "name", code), code), dtype, string(value),
+           string(as_int(get(b, "min_subtotal_cents", 0), 0)), string(as_int(get(b, "max_discount_cents", 0), 0)),
+           string(as_int(get(b, "usage_limit", 0), 0)), string(now())]);
+  let v = db.row("SELECT * FROM vouchers WHERE upper(code) = ?", [code]);
+  return s.created({ id: as_int(get(v, "id", 0), 0), code: code, value: value, active: true });
+};
+
+patch "/api/admin/vouchers/:id", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let id = as_int(get(req.params, "id", 0), 0);
+  if (db.row("SELECT id FROM vouchers WHERE id = ?", [string(id)]) == null) { return s.err(404, "券未找到"); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let active = as_int(get(b, "active", 1), 1) == 1;
+  db.exec("UPDATE vouchers SET active = ? WHERE id = ?", [active ? "1" : "0", string(id)]);
+  return s.ok({ id: id, active: active });
+};
+
+get "/api/admin/reviews", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT r.*, p.name AS product_name FROM reviews r JOIN products p ON p.id = r.product_id ORDER BY r.id DESC LIMIT 200");
+  let out = [];
+  if (rows != null) { for (r in rows) { let o = review_obj(r); put(o, "product_name", s.str_or(get(r, "product_name", ""), "")); put(o, "email", get(r, "email", "")); push(out, o); } }
+  return s.ok({ reviews: out });
+};
+
+patch "/api/admin/reviews/:id", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let id = as_int(get(req.params, "id", 0), 0);
+  if (db.row("SELECT id FROM reviews WHERE id = ?", [string(id)]) == null) { return s.err(404, "评价未找到"); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let status = as_int(get(b, "status", 1), 1);
+  if (status < 0 or status > 2) { return s.err(422, "status 需为 0/1/2"); }
+  db.exec("UPDATE reviews SET status = ? WHERE id = ?", [string(status), string(id)]);
+  return s.ok({ id: id, status: status });
+};
+
+get "/api/admin/pages", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT * FROM flatpages ORDER BY url");
+  let out = [];
+  if (rows != null) { for (r in rows) { push(out, {
+    id: as_int(get(r, "id", 0), 0), url: s.str_or(get(r, "url", ""), ""),
+    title: s.str_or(get(r, "title", ""), ""), content: get(r, "content", "")
+  }); } }
+  return s.ok({ pages: out });
+};
+
+// 管理端内容页导出（admin-only）：CSV（复用 csv_field）。
+get "/api/admin/pages/export", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let rows = db.q0("SELECT * FROM flatpages ORDER BY url");
+  let head = ["id","url","title","registration_required","updated_at"];
+  let lines = [];
+  let hline = [];
+  for (h in head) { push(hline, csv_field(h)); }
+  push(lines, join(hline, ","));
+  if (rows != null) {
+    for (r in rows) {
+      let cell = [string(as_int(get(r, "id", 0), 0)),
+                  s.str_or(get(r, "url", ""), ""),
+                  s.str_or(get(r, "title", ""), ""),
+                  string(as_int(get(r, "registration_required", 0), 0)),
+                  s.str_or(s.iso_or_null(get(r, "updated_at", null)), "")];
+      let c = [];
+      for (v in cell) { push(c, csv_field(v)); }
+      push(lines, join(c, ","));
+    }
+  }
+  let csv = join(lines, "\n") + "\n";
+  return { status: 200, type: "text/csv; charset=utf-8", body: csv,
+           headers: { "Content-Disposition": "attachment; filename=\"pages.csv\"", "Cache-Control": "no-store" } };
+};
+
+patch "/api/admin/pages/:id", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  let id = as_int(get(req.params, "id", 0), 0);
+  if (db.row("SELECT id FROM flatpages WHERE id = ?", [string(id)]) == null) { return s.err(404, "页面未找到"); }
+  let b = s.parse_body(req);
+  if (b == null) { return s.err(422, "请求体不是合法 JSON"); }
+  let title = trim(s.str_or(get(b, "title", ""), ""));
+  if (len(title) == 0) { return s.err(422, "标题必填"); }
+  db.exec("UPDATE flatpages SET title = ?, content = ?, updated_at = ? WHERE id = ?",
+          [title, s.str_or(get(b, "content", ""), ""), string(now()), string(id)]);
+  return s.ok({ id: id, title: title });
+};
+
+get "/api/admin/reports", (req) => {
+  let g = admin_ok(req);
+  if (g != null) { return g; }
+  // 可选 ?since=（epoch 秒或 YYYY-MM-DD[THH:MM:SS]，UTC）：过滤汇总/畅销榜；
+  // trend_7d 与 this_month 是「近7天/本月」固定窗口卡片，保持自身口径。
+  let since = s.parse_epoch(get(req.query_params, "since", ""));
+  let since_clause = "";
+  let since_params = [];
+  if (since != null) {
+    since_clause = " AND created_at >= ?";
+    push(since_params, string(since));
+  }
+  let paid_sql = "SELECT COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS gross FROM orders WHERE status = 'paid'" + since_clause;
+  let paid = db.row(paid_sql, since_params);
+  let refunded_sql = "SELECT COUNT(*) AS n, COALESCE(SUM(refunded_cents),0) AS amount FROM orders";
+  if (len(since_clause) > 0) { refunded_sql = refunded_sql + " WHERE 1=1" + since_clause; }
+  let refunded = db.row(refunded_sql, since_params);
+  // 不依赖 SQLite json_each：逐单解析 items_json 在 lume 侧聚合（订单量小，演示足够）
+  let paid_rows = db.q("SELECT items_json FROM orders WHERE status = 'paid'" + since_clause, since_params);
+  let counts = {};
+  if (paid_rows != null) {
+    for (o in paid_rows) {
+      let parsed = try(() => json(s.str_or(get(o, "items_json", "[]"), "[]")));
+      let its = get(parsed, "ok", []);
+      for (it in its) {
+        let name = s.str_or(get(it, "name", ""), "");
+        if (len(name) > 0) { put(counts, name, as_int(get(counts, name, 0), 0) + as_int(get(it, "quantity", 0), 0)); }
+      }
+    }
+  }
+  let rows = [];
+  for (name in keys(counts)) { push(rows, { name: name, qty: as_int(get(counts, name, 0), 0) }); }
+  let n = len(rows);
+  let oi = 0;
+  while (oi < n) {
+    let oj = 0;
+    while (oj < n - 1 - oi) {
+      let a = as_int(get(get(rows, oj, {}), "qty", 0), 0);
+      let b = as_int(get(get(rows, oj + 1, {}), "qty", 0), 0);
+      if (a < b) {
+        let tmp = get(rows, oj, {});
+        put(rows, oj, get(rows, oj + 1, {}));
+        put(rows, oj + 1, tmp);
+      }
+      oj = oj + 1;
+    }
+    oi = oi + 1;
+  }
+  if (n > 10) {
+    let limited = [];
+    let ki = 0;
+    while (ki < 10) { push(limited, get(rows, ki, {})); ki = ki + 1; }
+    rows = limited;
+  }
+  // 销售趋势（与 get_store_stats 一致）：近7天逐日补零 + 本月
+  let tq = db.q("SELECT date(created_at,'unixepoch') AS day, COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS gross FROM orders WHERE status='paid' AND created_at >= ? GROUP BY day",
+                [string(now() - 7 * 86400)]);
+  let trend = {};
+  if (tq != null) {
+    for (row in tq) {
+      put(trend, s.str_or(get(row, "day", ""), ""), { n: as_int(get(row, "n", 0), 0), gross: as_int(get(row, "gross", 0), 0) });
+    }
+  }
+  let trend_7d = [];
+  let base = now() - (now() % 86400);
+  let di = 6;
+  while (di >= 0) {
+    let ts = base - di * 86400;
+    let day = substr(str(s.iso_or_null(ts)), 0, 10);
+    let g = get(trend, day, null);
+    let tn = 0;
+    let tg = 0;
+    if (g != null) { tn = get(g, "n", 0); tg = get(g, "gross", 0); }
+    push(trend_7d, { date: day, orders: tn, gross_cents: tg, gross: tg / 100.0 });
+    di = di - 1;
+  }
+  let ms = db.q0("SELECT strftime('%s', date('now','start of month')) AS ms");
+  let month_start = as_int(get(get(ms, 0, {}), "ms", 0), 0);
+  let month = db.row("SELECT COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS gross FROM orders WHERE status='paid' AND created_at >= ?",
+                     [string(month_start)]);
+  let mg = as_int(get(month, "gross", 0), 0);
+  return s.ok({
+    paid_orders: as_int(get(paid, "n", 0), 0),
+    gross_cents: as_int(get(paid, "gross", 0), 0),
+    refunded_cents: as_int(get(refunded, "amount", 0), 0),
+    top_products: rows,
+    trend_7d: trend_7d,
+    this_month: { orders: as_int(get(month, "n", 0), 0), gross_cents: mg, gross: mg / 100.0 }
+  });
+};
+
+// ============================================================
+// Agent 工具（LLM 可调用的商店能力）
+//   供 lume 原生 Agent（POST /react/api/chat）注册给 LLM 的函数。
+//   只读公开数据（目录/订单状态/经营统计），不含用户隐私（邮件/地址）。
+//   金额一律整数分（price_cents）；返回对象由框架自动序列化为 JSON 给模型。
+// ============================================================
+
+// 只读、无副作用；参数缺省按类型给零值，可选字段用 get() 兜底。
+tool "search_products", "查询商店在售商品列表（可按关键词/分类过滤）",
+  { keyword: string, category: string, limit: int },
+  func(arg) {
+    let kw = trim(s.str_or(get(arg, "keyword", ""), ""));
+    let cat = trim(s.str_or(get(arg, "category", ""), ""));
+    let limit = as_int(get(arg, "limit", 10), 10);
+    if (limit < 1) { limit = 10; }
+    if (limit > 50) { limit = 50; }
+    let sql = "SELECT * FROM products WHERE displayable = 1";
+    let params = [];
+    if (len(kw) > 0) {
+      let like = "%" + kw + "%";
+      sql = sql + " AND (name LIKE ? OR description LIKE ? OR sku LIKE ?)";
+      push(params, like); push(params, like); push(params, like);
+    }
+    if (len(cat) > 0) {
+      sql = sql + " AND category = ?";
+      push(params, cat);
+    }
+    sql = sql + " ORDER BY name LIMIT ?";
+    push(params, string(limit));
+    let rows = db.q(sql, params);
+    return { count: len(rows), results: product_list(rows) };
+  };
+
+tool "get_product", "按 slug 查询单个商品详情（含同分类推荐）",
+  { slug: string },
+  func(arg) {
+    let slug = s.str_or(get(arg, "slug", ""), "");
+    if (len(slug) == 0) { return { error: "缺少 slug" }; }
+    let r = db.row("SELECT * FROM products WHERE slug = ? AND displayable = 1", [slug]);
+    if (r == null) { return { error: "商品未找到" }; }
+    return product_obj(r);
+  };
+
+tool "get_categories", "列出商店商品分类及各类商品数",
+  {},
+  func(arg) {
+    let rows = db.q0("SELECT category, COUNT(*) AS n FROM products WHERE displayable = 1 AND category IS NOT NULL GROUP BY category ORDER BY category");
+    let out = [];
+    if (rows != null) {
+      for (r in rows) {
+        push(out, { name: get(r, "category", ""), count: as_int(get(r, "n", 0), 0) });
+      }
+    }
+    return { categories: out };
+  };
+
+tool "get_store_stats", "商店经营统计：商品数、分类数、已支付订单数、总销售额、近7天销售趋势、本月销售",
+  {},
+  func(arg) {
+    let p = db.q0("SELECT COUNT(*) AS n FROM products WHERE displayable = 1");
+    let c = db.q0("SELECT COUNT(DISTINCT category) AS n FROM products WHERE displayable = 1 AND category IS NOT NULL");
+    let paid = db.row("SELECT COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS gross FROM orders WHERE status = 'paid'", []);
+    let gross = as_int(get(paid, "gross", 0), 0);
+    // 近 7 天销售趋势：按天分组（UTC），无单日补零，保证返回完整 7 天
+    let tq = db.q("SELECT date(created_at,'unixepoch') AS day, COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS gross FROM orders WHERE status='paid' AND created_at >= ? GROUP BY day",
+                  [string(now() - 7 * 86400)]);
+    let trend = {};
+    if (tq != null) {
+      for (row in tq) {
+        put(trend, s.str_or(get(row, "day", ""), ""), { n: as_int(get(row, "n", 0), 0), gross: as_int(get(row, "gross", 0), 0) });
+      }
+    }
+    let trend_7d = [];
+    let base = now() - (now() % 86400);
+    let di = 6;
+    while (di >= 0) {
+      let ts = base - di * 86400;
+      let day = substr(str(s.iso_or_null(ts)), 0, 10);
+      let g = get(trend, day, null);
+      let n = 0;
+      let gr = 0;
+      if (g != null) { n = get(g, "n", 0); gr = get(g, "gross", 0); }
+      push(trend_7d, { date: day, orders: n, gross_cents: gr, gross: gr / 100.0 });
+      di = di - 1;
+    }
+    // 本月（自然月，UTC 起）
+    let ms = db.q0("SELECT strftime('%s', date('now','start of month')) AS ms");
+    let month_start = as_int(get(get(ms, 0, {}), "ms", 0), 0);
+    let month = db.row("SELECT COUNT(*) AS n, COALESCE(SUM(total_cents),0) AS gross FROM orders WHERE status='paid' AND created_at >= ?",
+                       [string(month_start)]);
+    let mg = as_int(get(month, "gross", 0), 0);
+    return {
+      product_count: as_int(get(get(p, 0, {}), "n", 0), 0),
+      category_count: as_int(get(get(c, 0, {}), "n", 0), 0),
+      paid_order_count: as_int(get(paid, "n", 0), 0),
+      gross_cents: gross,
+      gross: gross / 100.0,
+      trend_7d: trend_7d,
+      this_month: {
+        orders: as_int(get(month, "n", 0), 0),
+        gross_cents: mg,
+        gross: mg / 100.0
+      }
+    };
+  };
+
+// 订单状态跟踪：只回公开字段（无邮件/地址/退款明细），供客服/物流问答。
+tool "track_order", "按订单号查询订单状态与商品明细（不含用户隐私）",
+  { order_no: string },
+  func(arg) {
+    let no = s.str_or(get(arg, "order_no", ""), "");
+    if (len(no) == 0) { return { error: "缺少 order_no" }; }
+    let o = db.row("SELECT * FROM orders WHERE order_no = ?", [no]);
+    if (o == null) { return { error: "订单未找到" }; }
+    let items = [];
+    let ij = get(o, "items_json", "[]");
+    if (ij != null and len(ij) > 0) {
+      let parsed = try(() => json(ij));
+      if (get(parsed, "err", null) == null and get(parsed, "ok", null) != null) {
+        items = get(parsed, "ok", []);
+      }
+    }
+    return {
+      order_no: no,
+      status: s.str_or(get(o, "status", ""), ""),
+      total_cents: as_int(get(o, "total_cents", 0), 0),
+      total: as_int(get(o, "total_cents", 0), 0) / 100.0,
+      currency: s.str_or(get(o, "currency", "USD"), "USD"),
+      item_count: as_int(get(o, "item_count", 0), 0),
+      items: items,
+      created_at: as_int(get(o, "created_at", 0), 0)
+    };
+  };
+
+// ============================================================
+// 未注册路径：不建 custom route 兜底，让它们落到宿主 docroot（./web/dist）静态层，
+// 静态 404 + Accept: text/html 时走 SPA history fallback → index.html。
+// 而 /api/* /auth/* /static/* 是已注册 custom route，优先级高于 docroot。
+// ============================================================
+
+// ---------- 启动前自检 + 交给宿主（agent-httpd）运行 ----------
+let app_env = s.env_or("APP_ENV", "development");
+if (app_env == "production" and not pp.configured()) {
+  print("refusing to start: production 需要 PayPal 凭据（" + cfg.path() + "）");
+} else {
+  if (not auth.secret_is_configured()) {
+    print("warning: secret_key 未配置，" + cfg.path() + " 缺失；仅限本地开发");
+  }
+  if (not pp.configured()) {
+    print("warning: PayPal 凭据未配置，下单/结算将不可用；目录与静态功能不受影响");
+  }
+  run();
+}

@@ -1,0 +1,23 @@
+{
+  "name": "oscar-paypal-lume-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node build.mjs --watch",
+    "build": "node build.mjs",
+    "build:css": "node build.mjs",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.1",
+    "@rollup/wasm-node": "^4.68.7",
+    "@vitejs/plugin-vue": "^5.0.0",
+    "@vue/compiler-sfc": "^3.5.45",
+    "esbuild": "^0.28.2",
+    "vite": "^5.0.0"
+  }
+}

@@ -1,0 +1,246 @@
+// init.lume —— oscar-paypal-lume 幂等建表 + seed
+//
+// 对标 django-oscar-paypal-store：Oscar 的 catalog/basket/order/payment
+// 模型拍平成 5 张表（演示切片，不需要 Oscar 的 30+ 张表）。
+//
+//   ./bin/lume init.lume
+
+import "lib/db.lume" as db;
+import "lib/config.lume" as cfg;
+
+let ddl = [
+  "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'customer', created_at INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS products (id INTEGER PRIMARY KEY AUTOINCREMENT, sku TEXT NOT NULL UNIQUE, slug TEXT NOT NULL, name TEXT NOT NULL, description TEXT, category TEXT, category_path TEXT, price_cents INTEGER NOT NULL, stock INTEGER NOT NULL DEFAULT 0, image TEXT, displayable INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS baskets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE(user_id))",
+  "CREATE TABLE IF NOT EXISTS basket_items (id INTEGER PRIMARY KEY AUTOINCREMENT, basket_id INTEGER NOT NULL, product_id INTEGER NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, UNIQUE(basket_id, product_id))",
+  "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY AUTOINCREMENT, order_no TEXT NOT NULL UNIQUE, user_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', total_cents INTEGER NOT NULL, currency TEXT NOT NULL DEFAULT 'USD', item_count INTEGER NOT NULL DEFAULT 0, paypal_order_id TEXT, paypal_capture_id TEXT, items_json TEXT, created_at INTEGER NOT NULL, paid_at INTEGER, refunded_cents INTEGER NOT NULL DEFAULT 0, refunds_json TEXT NOT NULL DEFAULT '[]')",
+  "CREATE TABLE IF NOT EXISTS rate_limits (key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS visits (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, method TEXT NOT NULL, ip TEXT, ua TEXT, referrer TEXT, created INTEGER NOT NULL)",
+  // ---- 账户 / 地址簿（对齐 Oscar customer + address）----
+  "CREATE TABLE IF NOT EXISTS user_addresses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, first_name TEXT NOT NULL, last_name TEXT NOT NULL, line1 TEXT NOT NULL, line2 TEXT, line3 TEXT, city TEXT NOT NULL, state TEXT, postcode TEXT NOT NULL, country TEXT NOT NULL DEFAULT 'CN', phone TEXT, notes TEXT, is_default_shipping INTEGER NOT NULL DEFAULT 0, is_default_billing INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS password_resets (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, token TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, used_at INTEGER)",
+  // ---- 愿望单（对齐 Oscar wishlists，演示为单列表 + 多行）----
+  "CREATE TABLE IF NOT EXISTS wishlists (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, name TEXT NOT NULL DEFAULT 'Default', visibility TEXT NOT NULL DEFAULT 'PRIVATE', share_key TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, UNIQUE(user_id, name))",
+  "CREATE TABLE IF NOT EXISTS wishlist_lines (id INTEGER PRIMARY KEY AUTOINCREMENT, wishlist_id INTEGER NOT NULL, product_id INTEGER NOT NULL, quantity INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, UNIQUE(wishlist_id, product_id))",
+  // ---- 评价（对齐 Oscar reviews）----
+  "CREATE TABLE IF NOT EXISTS reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL, user_id INTEGER, name TEXT, email TEXT, title TEXT NOT NULL, body TEXT, score INTEGER NOT NULL DEFAULT 5, status INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)",
+  // ---- 优惠券（对齐 Oscar voucher 的 code/usage/discount，演示为一种简化 benefit）----
+  "CREATE TABLE IF NOT EXISTS vouchers (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL, discount_type TEXT NOT NULL DEFAULT 'percentage', value INTEGER NOT NULL, min_subtotal_cents INTEGER NOT NULL DEFAULT 0, max_discount_cents INTEGER NOT NULL DEFAULT 0, usage_limit INTEGER NOT NULL DEFAULT 0, num_orders INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, start_at INTEGER, end_at INTEGER, created_at INTEGER NOT NULL)",
+  "CREATE TABLE IF NOT EXISTS basket_vouchers (id INTEGER PRIMARY KEY AUTOINCREMENT, basket_id INTEGER NOT NULL, voucher_id INTEGER NOT NULL, created_at INTEGER NOT NULL, UNIQUE(basket_id, voucher_id))",
+  // ---- 内容页（对齐 Oscar flatpage /about/）----
+  "CREATE TABLE IF NOT EXISTS flatpages (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT NOT NULL UNIQUE, title TEXT NOT NULL, content TEXT, registration_required INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL)"
+];
+
+let failed = 0;
+let i = 0;
+while (i < len(ddl)) {
+  let stmt = get(ddl, i, "SELECT 1");
+  let r = try(() => db.exec0(stmt));
+  if (get(r, "err", null) != null) {
+    print("FAILED: " + stmt);
+    print("  " + stringify(get(r, "err", "")));
+    failed = 1;
+  }
+  i = i + 1;
+}
+
+// 幂等迁移：老库缺列时 CREATE TABLE IF NOT EXISTS 不会补。
+// 用 SELECT 探针判断列是否存在（PRAGMA 的字段名在 lume map 里不可靠）；
+// sql_write 的 guard 禁止 ALTER 带字面量 DEFAULT，所以先加裸列再参数化回填。
+func ensure_col(table, col, decl) {
+  let probe = try(() => sql_query(db.dsn(), "SELECT " + col + " FROM " + table + " LIMIT 1"));
+  if (get(probe, "err", null) == null) { return true; }
+  let a = try(() => db.exec0("ALTER TABLE " + table + " ADD COLUMN " + col + " " + decl));
+  if (get(a, "err", null) != null and not contains(stringify(get(a, "err", "")), "duplicate column")) {
+    print("migrate " + table + "." + col + " failed: " + stringify(get(a, "err", "")));
+    return false;
+  }
+  return true;
+}
+
+for (c in [
+  ["orders", "refunded_cents", "INTEGER"],
+  ["orders", "refunds_json", "TEXT"],
+  ["orders", "guest_email", "TEXT"],
+  ["orders", "voucher_code", "TEXT"],
+  ["orders", "discount_cents", "INTEGER"],
+  ["users", "email", "TEXT"]
+]) {
+  if (not ensure_col(get(c, 0, ""), get(c, 1, ""), get(c, 2, ""))) { failed = 1; }
+}
+let fix = try(() => db.exec(
+  "UPDATE orders SET refunded_cents = ?, refunds_json = ?, discount_cents = ? WHERE refunded_cents IS NULL OR refunds_json IS NULL OR discount_cents IS NULL",
+  [string(0), "[]", string(0)]));
+if (get(fix, "err", null) != null) {
+  print("migrate backfill failed: " + stringify(get(fix, "err", "")));
+  failed = 1;
+}
+
+if (failed == 0) {
+  print("schema ready: " + db.dsn());
+} else {
+  print("schema init failed, fix the statement above and re-run");
+}
+
+// ---------- seed：商品（140 本，从原 Oscar fixture CSV + 图片导出）----------
+// 幂等：products 非空则跳过。SEED_DATA=0 关闭；文件用 SEED_PRODUCTS 覆盖。
+func env_or(name, dflt) {
+  let v = env(name);
+  if (v == null) { return dflt; }
+  if (len(v) == 0) { return dflt; }
+  return v;
+}
+
+func read_json(path) {
+  let r = try(() => read_file(path));
+  if (get(r, "err", null) != null) { return null; }
+  let raw = get(r, "ok", null);
+  if (raw == null or len(raw) == 0) { return null; }
+  let j = try(() => json(raw));
+  if (get(j, "err", null) != null) { return null; }
+  return get(j, "ok", null);
+}
+
+if (failed == 0 and env_or("SEED_DATA", "1") != "0") {
+  let seed_file = env_or("SEED_PRODUCTS", "./seed/products.json");
+  let n = try(() => sql_query(db.dsn(), "SELECT COUNT(*) AS n FROM products"));
+  let rows = get(n, "ok", null);
+  let count = 0;
+  if (rows != null and len(rows) > 0) { count = int(get(get(rows, 0, {}), "n", 0)); }
+
+  if (count > 0) {
+    print("seed: products 已有 " + string(count) + " 条，跳过");
+  } else {
+    let doc = read_json(seed_file);
+    if (doc == null) {
+      print("seed: 配置缺失或不是合法 JSON：" + seed_file + "（跳过）");
+    } else {
+      let products = doc; // 默认：seed 文件是裸数组
+      // 兼容 {products:[...]}：对数组取字符串 key 会 err，对 map 取到值就采用
+      let probe = try(() => get(doc, "products", null));
+      if (get(probe, "err", null) == null and get(probe, "ok", null) != null) {
+        products = get(probe, "ok", []);
+      }
+      let seeded = 0;
+      for (p in products) {
+        let price = float(get(p, "price", 0));
+        let price_cents = int(round(price * 100));
+        let w = try(() => sql_write(db.dsn(),
+          "INSERT INTO products (sku, slug, name, description, category, category_path, price_cents, stock, image, displayable, created_at) VALUES (?,?,?,?,?,?,?,?,?,1,?)",
+          [get(p, "sku", ""), get(p, "slug", "p-" + get(p, "sku", "")), get(p, "name", "未命名"),
+           get(p, "description", null), get(p, "category", "Books"),
+           get(p, "category_path", "Books"), price_cents, int(get(p, "stock", 0)),
+           get(p, "image", null), now()]));
+        if (get(w, "err", null) == null) { seeded = seeded + 1; }
+      }
+      print("seed: products +" + string(seeded));
+    }
+  }
+}
+
+// ---------- seed：演示优惠券与内容页（Oscar 原仓没有对应 fixture，这是 lume 演示数据）----------
+if (failed == 0 and env_or("SEED_DATA", "1") != "0") {
+  let demo_vouchers = [
+    ["DEMO10", "10% off (demo)", "percentage", 10, 0, 1000, 0],
+    ["SAVE5", "$5 off $10+ (demo)", "absolute", 500, 1000, 0, 0]
+  ];
+  for (v in demo_vouchers) {
+    let code = get(v, 0, "");
+    let exists = db.row("SELECT id FROM vouchers WHERE code = ?", [code]);
+    if (exists == null) {
+      let w = try(() => db.exec(
+        "INSERT INTO vouchers (code, name, discount_type, value, min_subtotal_cents, max_discount_cents, usage_limit, active, created_at) VALUES (?,?,?,?,?,?,?,1,?)",
+        [code, get(v, 1, ""), get(v, 2, "percentage"), string(get(v, 3, 0)),
+         string(get(v, 4, 0)), string(get(v, 5, 0)), string(get(v, 6, 0)), string(now())]));
+      if (get(w, "err", null) != null) { print("seed voucher failed: " + code); failed = 1; }
+    }
+  }
+  // 内容页（About + 隐私/条款合规页）；幂等：url 已存在则跳过。
+  let pages = [
+    ["/about/", "About",
+     "Oscar PayPal Store 的 lume 演示切片：Vue3 前台 + lume 服务端 + PayPal Orders v2 沙箱支付。<br>Demo slice of django-oscar-paypal-store: Vue3 SPA, lume backend and PayPal sandbox Orders v2."],
+    ["/privacy/", "隐私 · Privacy",
+     "Lume 书店是技术演示站点：不处理真实资金（PayPal 仅 sandbox 模拟），只收集演示所需的最小信息（账号、收货地址、订单与支付引用），存储在演示 SQLite 库中，仅用于演示功能，不对外出售或共享。<br>" +
+     "演示站点的 AI 商店助手会把你的提问发送到配置的 LLM 服务以生成回答，请勿在对话中输入真实的敏感个人信息（如证件号、银行卡号）。<br>" +
+     "演示数据会定期清理；请勿上传真实个人敏感数据。<br><br>" +
+     "Lume Books is a demo: no real payments (PayPal sandbox only), only minimal demo data (account, address, order & payment refs) is collected and stored in a local demo DB for demo purposes only; never sold or shared.<br>" +
+     "The AI shop assistant forwards your prompt to the configured LLM service; do not enter real sensitive personal data.<br>" +
+     "Demo data is periodically purged; please do not upload real personal data."],
+    ["/terms/", "条款 · Terms",
+     "演示站点仅供技术展示，不构成任何真实交易、服务或要约；PayPal 支付为 sandbox 模拟，不产生真实资金流。<br>" +
+     "本站提供的商品、价格、评价均为演示数据，不承诺可用性或准确性。<br><br>" +
+     "This is a demo site for technical showcase only; no real transactions, services or offers; PayPal is sandbox-simulated with no real funds.<br>" +
+     "All products, prices and reviews are demo data with no warranty."]
+  ];
+  for (pg in pages) {
+    let purl = get(pg, 0, "");
+    let exists = db.row("SELECT id FROM flatpages WHERE url = ?", [purl]);
+    if (exists == null) {
+      let w2 = try(() => db.exec(
+        "INSERT INTO flatpages (url, title, content, registration_required, updated_at) VALUES (?,?,?,0,?)",
+        [purl, get(pg, 1, ""), get(pg, 2, ""), string(now())]));
+      if (get(w2, "err", null) != null) { print("seed flatpage failed: " + purl); failed = 1; }
+    }
+  }
+}
+
+// ---------- seed：演示评价（点亮前台评价区 + Product.aggregateRating）----------
+// 幂等：reviews 非空则跳过。仅 status=1（已审核）即时可见；name/email 为占位演示值
+// （agent.db 去 PII 快照本就不含 reviews.name/email，无隐私外泄）。
+func as_int_ok(v, dflt) {
+  let r = try(() => int(v));
+  if (get(r, "err", null) != null) { return dflt; }
+  return get(r, "ok", dflt);
+}
+if (failed == 0 and env_or("SEED_DATA", "1") != "0") {
+  let rn = try(() => sql_query(db.dsn(), "SELECT COUNT(*) AS n FROM reviews"));
+  let rrows = get(rn, "ok", null);
+  let rcount = 0;
+  if (rrows != null and len(rrows) > 0) { rcount = int(get(get(rrows, 0, {}), "n", 0)); }
+  if (rcount > 0) {
+    print("seed: reviews 已有 " + string(rcount) + " 条，跳过");
+  } else {
+    let demo_reviews = [
+      ["97-things-every-programmer-should-know", [
+        ["实用、每篇都能落地", "短小精悍，适合碎片时间翻一两篇，很多建议直接就能用上。", 5, "Demo Reader 1", "demo.reader1@example.com"],
+        ["值得反复读", "编程素养类好书，案例贴切，适合放在手边常翻。", 4, "Demo Reader 2", "demo.reader2@example.com"]
+      ]],
+      ["a-hymn-before-battle", [
+        ["硬科幻爱好者福音", "节奏快、设定硬核，军武科幻的经典之作。", 5, "Demo Reader 3", "demo.reader3@example.com"]
+      ]],
+      ["a-terrace-on-the-tower-of-babel", [
+        ["翻译流畅", "文笔不错，世界观宏大，读起来很过瘾。", 4, "Demo Reader 4", "demo.reader4@example.com"]
+      ]],
+      ["ansi-common-lisp", [
+        ["经典 Lisp 教材", "系统、严谨，配合实践能打好 Lisp 基本功。", 5, "Demo Reader 5", "demo.reader5@example.com"],
+        ["内容扎实但偏理论", "适合系统学习，需要自己多敲例子。", 3, "Demo Reader 6", "demo.reader6@example.com"]
+      ]],
+      ["accelerated-c", [
+        ["C 进阶好书", "讲得比入门书深，配合工程实践收获很大。", 4, "Demo Reader 7", "demo.reader7@example.com"]
+      ]],
+      ["advanced-programming-in-the-unix-environment", [
+        ["UNIX 编程圣经", "APUE 名副其实，系统编程必备参考。", 5, "Demo Reader 8", "demo.reader8@example.com"],
+        ["太厚了", "内容全面但篇幅大，建议配合笔记按需查阅。", 3, "Demo Reader 9", "demo.reader9@example.com"],
+        ["第 3 版更全面", "新版补了很多现代接口，值得更新书架。", 4, "Demo Reader 10", "demo.reader10@example.com"]
+      ]]
+    ];
+    let seeded_rev = 0;
+    for (entry in demo_reviews) {
+      let slug = get(entry, 0, "");
+      let pr = db.row("SELECT id FROM products WHERE slug = ?", [slug]);
+      if (pr == null) { continue; }
+      let pid = as_int_ok(get(pr, "id", 0), 0);
+      let revs = get(entry, 1, []);
+      let di = 0;
+      for (rv in revs) {
+        let w = try(() => db.exec(
+          "INSERT INTO reviews (product_id, user_id, name, email, title, body, score, status, created_at) VALUES (?,NULL,?,?,?,?,?,1,?)",
+          [string(pid), get(rv, 3, ""), get(rv, 4, ""), get(rv, 0, ""), get(rv, 1, ""),
+           string(get(rv, 2, 5)), string(now() - di * 86400)]));
+        if (get(w, "err", null) == null) { seeded_rev = seeded_rev + 1; }
+        di = di + 1;
+      }
+    }
+    print("seed: reviews +" + string(seeded_rev));
+  }
+}

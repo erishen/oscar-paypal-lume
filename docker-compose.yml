@@ -1,0 +1,67 @@
+# oscar-paypal-lume 容器编排（默认端口 18101，> 10000）
+#
+#   make docker-build   # 生成单一构建上下文并编译镜像（Linux 侧重编 lume）
+#   make docker-up      # 起服务（自动建库/灌 seed/建管理员）
+#   make docker-down    # 停服务（数据卷保留）
+#
+# 端口要改：PORT=19101 docker compose up -d   （容器与宿主端口同步改）
+# PayPal sandbox 凭据（可选）：PAYPAL_CLIENT_ID=... PAYPAL_CLIENT_SECRET=... PAYPAL_MODE=sandbox
+#   不提供时站点/目录/购物篮照常，仅下单链路返回 503。
+
+services:
+  web:
+    image: oscar-paypal-lume:dev
+    build:
+      context: .docker/ctx
+      dockerfile: Dockerfile
+    ports:
+      # 只绑宿主回环，避免把管理接口暴露到局域网
+      - "127.0.0.1:${PORT:-18101}:${PORT:-18101}"
+    environment:
+      PORT: "${PORT:-18101}"
+      # 弹性 worker 池：脚本请求全部走阻塞池，E2E 并发下 2 个 worker 会排队 503
+      WORKERS: "${WORKERS:-8}"
+      BIND: "0.0.0.0"
+      LUME_DB: "/app/.data/app.db"
+      # 密钥文件必须落在数据卷里，否则容器重建会重新生成会话密钥/管理员口令
+      CONF_FILE: "${CONF_FILE:-/app/.data/.secrets.json}"
+      # 不提供默认管理员口令；未显式设置时由 entrypoint 生成随机口令并写入密钥文件
+      ADMIN_USERNAME: "${ADMIN_USERNAME:-admin}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+      # PayPal sandbox（可选）
+      PAYPAL_CLIENT_ID: "${PAYPAL_CLIENT_ID:-}"
+      PAYPAL_CLIENT_SECRET: "${PAYPAL_CLIENT_SECRET:-}"
+      PAYPAL_MODE: "${PAYPAL_MODE:-sandbox}"
+      # ---- Agent（原生 POST /react/api/chat，经 tsmhub-lume 转发 token）----
+      # LLM_API_URL 指向 tsmhub-lume 的 OpenAI 兼容 /v1/chat/completions；
+      # LLM_API_KEY 是 tsm-hub 的客户端 key（sk-tr-…，放 .env，不进镜像）。
+      # LLM_API_KEY 留空时回退 lume 内置演示引擎（离线，无真实模型）。
+      LLM_API_URL: "${LLM_API_URL:-http://host.docker.internal:18108/v1/chat/completions}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_MODEL: "${LLM_MODEL:-auto}"
+      # Agent text2sql：lume 的 sql_query/sql_tables/sql_schema 在 SQLITE_DB 指向
+      # 已存在文件时注册。这里指向 entrypoint 构建的去 PII 快照 agent.db
+      # （不含 users/user_addresses/orders 的 user_id/guest_email 等），只读。
+      # 置空则 text2sql 不注册（agent 只剩下方固定工具）。
+      SQLITE_DB: "${SQLITE_DB:-/app/.data/agent.db}"
+      # agent.db 周期刷新间隔（秒）：entrypoint 后台原子重建，text2sql 看到
+      # 近实时数据（不再是启动快照）。0=关闭（退化启动快照）。
+      AGENT_DB_REFRESH: "${AGENT_DB_REFRESH:-30}"
+      # Agent 工具面：商店自身 tool + text2sql 只读三件套（sql_write 刻意不开放）。
+      # 排除 tsm-hub 路由同步进来的通用工具（read_file 等有读文件风险）。
+      # 置空可放开全部工具（含 tsm-hub 路由同步目录）。
+      HARNESS_TOOLS_ALLOW: "${HARNESS_TOOLS_ALLOW:-search_products,get_product,get_categories,get_store_stats,track_order,sql_query,sql_tables,sql_schema}"
+      # 商品列表 description 截断长度（字符）：0=保留完整；默认 140。仅列表 payload，详情不受影响。
+      DESC_TRUNC: "${DESC_TRUNC:-140}"
+    volumes:
+      - oscar-lume-data:/app/.data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$$PORT/health/deep"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  oscar-lume-data:

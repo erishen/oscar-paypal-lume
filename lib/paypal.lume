@@ -1,0 +1,397 @@
+// paypal.lume —— PayPal Orders v2 出站门面（OAuth token / create / capture / refund）
+//
+// 从 django-oscar-paypal-store 的 facade.py 移植：
+//   - OAuth client_credentials（Basic 认证）取 access_token，内存缓存 540s
+//   - create_order：每次点击用全新 PayPal-Request-Id（uuid4 口径），
+//     避免幂等键命中「上一个已 APPROVED/CAPTURED 的旧单」
+//   - capture_order：先 GET 对账（已 COMPLETED 直接合成 captured，不重复扣款）；
+//     POST 用稳定 PayPal-Request-Id（capture-<order_id>）保证重试幂等；
+//     422 ORDER_ALREADY_CAPTURED 时再 GET 对账，视为成功
+//   - refund_capture：全/部分退款，POST /v2/payments/captures/<id>/refund；
+//     带稳定 PayPal-Request-Id（refund-<capture_id>-<amount>-<currency>），
+//     全额退款省略 amount 字段（对齐 facade.py 的 amount=None 口径）
+//   - 所有出站调用统一走 request()：网络错误(status=0/err)重试 3 次；
+//     GET 与 OAuth POST 额外对 429/5xx 重试；create/capture/refund 的 POST
+//     只对网络错误重试（5xx 可能已处理，靠幂等键而非盲目重放，对齐 facade.py）
+//
+// 关键口径（与 facade.py 对齐 + lume 适配）：
+//   - 出站 http_get/http_post **不抛异常**，网络错误写进结果 map 的 err 字段，
+//     status=0；**不要**用 try() 包——try 会把响应塞进 .ok，
+//     外层读 status/body 会全拿到默认值（曾经误报 "PayPal OAuth 失败 HTTP 0"）。
+//   - 金额两位小数（facade.py 的 f'{:.2f}' 口径）；整数分进，money2() 出。
+//   - json() 对坏输入会抛，用 try() 包。
+//
+// 凭据从 .secrets.json 读（env() 对含 CLIENT_SECRET 的变量掩码，读不到）：
+//   { "paypal_client_id": "...", "paypal_client_secret": "...", "paypal_mode": "sandbox" }
+
+import "config.lume" as cfg;
+import "db.lume" as db;
+
+let _token = { at: 0, value: "" };
+let _state = { approve_url: "", order_id: "", capture_id: "", refund_id: "", refund_status: "" }; // 每次调用后填充，供 app.lume 读取
+
+export func base_url() {
+  let mode = cfg.value("paypal_mode", "sandbox");
+  if (mode == "live") { return "https://api-m.paypal.com"; }
+  return "https://api-m.sandbox.paypal.com";
+}
+
+// 出站调用统一入口：网络错误（status=0/err 非空）重试；
+// retry_status=true 时 GET/OAuth 这类安全调用额外重试 429/5xx。
+// create/capture/refund 的 POST 不重试 5xx：PayPal 可能已处理，
+// 重复请求靠 PayPal-Request-Id 幂等，而不是盲目重放（与 facade.py 一致）。
+// lume 语言无 sleep 内置，因此退避体现在“次数”上（最多 3 次）。
+func request(method, url, opts, retry_status) {
+  let r = null;
+  let i = 0;
+  while (i < 3) {
+    if (method == "GET") { r = http_get(url, opts); }
+    else { r = http_post(url, opts); }
+    let st = get(r, "status", 0);
+    let net_fail = len(get(r, "err", "")) > 0 or st == 0;
+    let transient = retry_status and (st == 429 or st == 500 or st == 502 or st == 503 or st == 504);
+    if (not net_fail and not transient) { return r; }
+    i = i + 1;
+  }
+  return r;
+}
+
+func creds() {
+  let id = s_str_or(cfg.value("paypal_client_id", ""), "");
+  let secret = s_str_or(cfg.value("paypal_client_secret", ""), "");
+  if (len(id) == 0 or len(secret) == 0) { return null; }
+  return { id: id, secret: secret };
+}
+
+func s_str_or(v, dflt) {
+  if (v == null) { return dflt; }
+  return v + "";
+}
+
+export func configured() {
+  return creds() != null;
+}
+
+// 整数分 → "12.34"（两位小数，PayPal 口径；纯字符串切片，不做 int/float 混合运算）
+export func money2(cents) {
+  let c = int(cents);
+  let neg = c < 0;
+  if (neg) { c = -c; }
+  let s = string(c);
+  let n = len(s);
+  let ipart = "0";
+  let frac = s;
+  if (n > 2) {
+    ipart = substr(s, 0, n - 2);
+    frac = substr(s, n - 2, 2);
+  } else if (n == 1) {
+    frac = "0" + s;
+  }
+  let out = ipart + "." + frac;
+  if (neg) { out = "-" + out; }
+  return out;
+}
+
+// ---- OAuth token（Basic 认证，内存缓存 540s，PayPal access_token 默认 10min）----
+export func access_token() {
+  let c = creds();
+  if (c == null) {
+    return { ok: false, err: "未配置 PayPal 凭据（.secrets.json: paypal_client_id / paypal_client_secret）" };
+  }
+  let now_ts = now();
+  if (now_ts < _token.at and len(_token.value) > 0) {
+    return { ok: true, token: _token.value };
+  }
+  let auth = "Basic " + base64_encode(get(c, "id", "") + ":" + get(c, "secret", ""));
+  // 直接调用：结果 map {ok, status, body, err, headers}；网络失败 status=0 + err 非空
+  let r = request("POST", base_url() + "/v1/oauth2/token", {
+    headers: {
+      "Authorization": auth,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "application/json"
+    },
+    body: "grant_type=client_credentials",
+    timeout: 30000
+  }, true);
+  if (len(get(r, "err", "")) > 0) {
+    return { ok: false, err: "PayPal OAuth 网络错误：" + get(r, "err", "") };
+  }
+  if (get(r, "status", 0) != 200) {
+    return { ok: false, err: "PayPal OAuth 失败 HTTP " + string(get(r, "status", 0)) + "：" + substr(get(r, "body", ""), 0, 300) };
+  }
+  let j = try(() => json(get(r, "body", "")));
+  if (get(j, "err", null) != null) {
+    return { ok: false, err: "PayPal OAuth 响应不是 JSON" };
+  }
+  let tok = get(get(j, "ok", {}), "access_token", "");
+  if (len(tok) == 0) {
+    return { ok: false, err: "PayPal OAuth 未返回 access_token" };
+  }
+  _token = { at: now_ts + 540, value: tok };
+  return { ok: true, token: tok };
+}
+
+// 随机 hex（create_order 的 PayPal-Request-Id 每次要全新，对齐 uuid4 的用途）
+let _seq = 0;
+func rand_hex() {
+  _seq = _seq + 1;
+  return substr(hmac_sha256("oscar-paypal-" + string(_seq), string(now())), 0, 32);
+}
+
+// PayPal 网络调用失败的统一 5xx 响应（诊断信息进 message，方便排障）
+func pp_network_err(kind, detail, status) {
+  return { status: status, type: "application/json",
+           body: stringify({ error: true, message: "PayPal " + kind + "：" + detail, status_code: status }),
+           headers: {} };
+}
+
+// 下单：返回 null（成功，_state.approve_url 已填）或 5xx 响应 map
+export func create_order_for(order_id, items, total_cents, currency, return_url, cancel_url) {
+  let t = access_token();
+  if (not get(t, "ok", false)) {
+    return pp_network_err("凭据/网络不可用", get(t, "err", ""), 503);
+  }
+  let tok = get(t, "token", "");
+  let lines = [];
+  let lines_total = 0;
+  for (it in items) {
+    let qty = get(it, "quantity", 1);
+    let pc = get(it, "price_cents", 0);
+    lines_total = lines_total + pc * qty;
+    push(lines, {
+      name: get(it, "name", "Item"),
+      unit_amount: { currency_code: currency, value: money2(pc) },
+      quantity: string(qty)
+    });
+  }
+  // total_cents 是折后应付额；行项目按原价计。差值即券折扣，必须写进
+  // breakdown.discount，否则 PayPal 校验 ITEM_TOTAL_MISMATCH（422）。
+  let discount = lines_total - total_cents;
+  if (discount < 0) { discount = 0; }
+  let breakdown = {
+    item_total: { currency_code: currency, value: money2(lines_total) },
+    discount: { currency_code: currency, value: money2(discount) }
+  };
+  let body = {
+    intent: "CAPTURE",
+    purchase_units: [{
+      amount: {
+        currency_code: currency,
+        value: money2(total_cents),
+        breakdown: breakdown
+      },
+      items: lines
+    }],
+    application_context: {
+      return_url: return_url,
+      cancel_url: cancel_url,
+      brand_name: "Oscar Demo Store",
+      landing_page: "LOGIN",
+      user_action: "PAY_NOW",
+      shipping_preference: "NO_SHIPPING"
+    }
+  };
+  // 幂等键在 request() 外生成一次，3 次重试复用同一 PayPal-Request-Id，
+  // 避免网络抖动重试时误建两张订单。
+  let create_req_id = "oscar-create-" + rand_hex();
+  let resp = request("POST", base_url() + "/v2/checkout/orders", {
+    headers: {
+      "Authorization": "Bearer " + tok,
+      "Content-Type": "application/json",
+      // 全新 id / 每次结算：复用旧 id 会命中已 APPROVED/CAPTURED 的旧单，无 approve 链接
+      "PayPal-Request-Id": create_req_id
+    },
+    body: stringify(body),
+    timeout: 30000
+  }, false);
+  if (len(get(resp, "err", "")) > 0) {
+    return pp_network_err("创建订单网络错误", get(resp, "err", ""), 502);
+  }
+  let st = get(resp, "status", 0);
+  if (st != 200 and st != 201) {
+    return pp_network_err("创建订单失败 HTTP " + string(st), substr(get(resp, "body", ""), 0, 300), 502);
+  }
+  let data = try(() => json(get(resp, "body", "")));
+  if (get(data, "err", null) != null) {
+    return pp_network_err("创建订单响应不是 JSON", get(data, "err", ""), 502);
+  }
+  let d = get(data, "ok", {});
+  let pp_id = get(d, "id", "");
+  let approve_url = "";
+  let links = get(d, "links", []);
+  for (l in links) {
+    if (get(l, "rel", "") == "approve") { approve_url = get(l, "href", ""); break; }
+  }
+  if (len(approve_url) == 0) {
+    return pp_network_err("未返回 approve 链接（订单 " + pp_id + "，状态 " + get(d, "status", "?") + "）", "", 502);
+  }
+  db.exec("UPDATE orders SET paypal_order_id = ? WHERE id = ?", [pp_id, string(order_id)]);
+  _state.approve_url = approve_url;
+  _state.order_id = pp_id;
+  _state.capture_id = "";
+  return null;
+}
+
+// 取最近一次 create_order 的状态（app.lume 用 approve_url）
+export func last_state() {
+  return _state;
+}
+
+// 存 capture id（内部）
+func save_capture(order_id, cid) {
+  if (len(cid) > 0) {
+    db.exec("UPDATE orders SET paypal_capture_id = ? WHERE id = ?", [cid, string(order_id)]);
+  }
+}
+
+// capture：先 GET 对账，再稳定 Request-Id POST；422 ALREADY_CAPTURED 视为成功。
+// 成功：返回 null 并填 _state.capture_id；失败：返回 5xx 响应。
+export func capture_order(order_id, paypal_order_id, buyer_token) {
+  if (len(paypal_order_id) == 0 and len(buyer_token) > 0) {
+    // 库里的 paypal_order_id 丢了：兜底用 buyer token 查 PayPal 侧订单号
+    let t2 = access_token();
+    if (not get(t2, "ok", false)) { return pp_network_err("对账凭据/网络不可用", get(t2, "err", ""), 503); }
+    let look = request("GET", base_url() + "/v2/checkout/orders/" + buyer_token, {
+      headers: { "Authorization": "Bearer " + get(t2, "token", "") }, timeout: 30000 }, true);
+    if (len(get(look, "err", "")) > 0) {
+      return pp_network_err("对账网络错误", get(look, "err", ""), 502);
+    }
+    if (get(look, "status", 0) != 200) {
+      return pp_network_err("对账失败 HTTP " + string(get(look, "status", 0)), substr(get(look, "body", ""), 0, 200), 502);
+    }
+    let ld = try(() => json(get(look, "body", "")));
+    paypal_order_id = get(get(ld, "ok", {}), "id", "");
+    if (len(paypal_order_id) == 0) {
+      return pp_network_err("无法定位 PayPal 订单（token=" + buyer_token + "）", "", 502);
+    }
+  }
+  if (len(paypal_order_id) == 0) {
+    return pp_network_err("订单缺少 paypal_order_id，无法 capture", "", 502);
+  }
+
+  // 1) 对账：已 COMPLETED → 不重复 capture
+  let t = access_token();
+  if (not get(t, "ok", false)) {
+    return pp_network_err("凭据/网络不可用", get(t, "err", ""), 503);
+  }
+  let g = request("GET", base_url() + "/v2/checkout/orders/" + paypal_order_id, {
+    headers: { "Authorization": "Bearer " + get(t, "token", "") }, timeout: 30000 }, true);
+  if (len(get(g, "err", "")) > 0) {
+    return pp_network_err("对账网络错误", get(g, "err", ""), 502);
+  }
+  if (get(g, "status", 0) == 200) {
+    let gd = try(() => json(get(g, "body", "")));
+    let gd_ok = get(gd, "ok", {});
+    if (get(gd_ok, "status", "") == "COMPLETED") {
+      let cid = capture_id_from(gd_ok);
+      _state.capture_id = cid;
+      save_capture(order_id, cid);
+      return null;
+    }
+  }
+
+  // 2) 稳定 Request-Id 的 capture POST（重试幂等）
+  let cap = request("POST", base_url() + "/v2/checkout/orders/" + paypal_order_id + "/capture", {
+    headers: {
+      "Authorization": "Bearer " + get(t, "token", ""),
+      "Content-Type": "application/json",
+      // 稳定键：网络错误重试/重复回跳都返回第一次的 capture 结果
+      "PayPal-Request-Id": "capture-" + string(order_id)
+    },
+    body: "",
+    timeout: 30000
+  }, false);
+  if (len(get(cap, "err", "")) > 0) {
+    return pp_network_err("capture 网络错误", get(cap, "err", ""), 502);
+  }
+  let st = get(cap, "status", 0);
+  if (st == 200 or st == 201) {
+    let cd = try(() => json(get(cap, "body", "")));
+    let cid = capture_id_from(get(cd, "ok", {}));
+    _state.capture_id = cid;
+    save_capture(order_id, cid);
+    return null;
+  }
+  // 3) 422 ORDER_ALREADY_CAPTURED：钱已扣，GET 对账视为成功
+  if (st == 422 and has_issue(get(cap, "body", ""), "ORDER_ALREADY_CAPTURED")) {
+    let g2 = request("GET", base_url() + "/v2/checkout/orders/" + paypal_order_id, {
+      headers: { "Authorization": "Bearer " + get(t, "token", "") }, timeout: 30000 }, true);
+    let g2d = try(() => json(get(g2, "body", "")));
+    let cid = capture_id_from(get(g2d, "ok", {}));
+    _state.capture_id = cid;
+    save_capture(order_id, cid);
+    return null;
+  }
+  return pp_network_err("capture 失败 HTTP " + string(st), substr(get(cap, "body", ""), 0, 300), 502);
+}
+
+// capture id：purchase_units[0].payments.captures[0].id
+func capture_id_from(data) {
+  let pus = get(data, "purchase_units", []);
+  if (len(pus) == 0) { return ""; }
+  let caps = get(get(pus, 0, {}), "payments", {});
+  let cs = get(caps, "captures", []);
+  if (len(cs) == 0) { return ""; }
+  return get(get(cs, 0, {}), "id", "");
+}
+
+func has_issue(body_raw, code) {
+  let j = try(() => json(body_raw));
+  if (get(j, "err", null) != null) { return false; }
+  let details = get(get(j, "ok", {}), "details", []);
+  for (d in details) {
+    if (get(d, "issue", "") == code) { return true; }
+  }
+  return false;
+}
+
+// 取消 PayPal 侧订单（尽力而为；订单真实状态以库为准）
+export func order_cancel(paypal_order_id) {
+  if (len(paypal_order_id) == 0) { return; }
+  let t = access_token();
+  if (not get(t, "ok", false)) { return; }
+  let r = request("POST", base_url() + "/v2/checkout/orders/" + paypal_order_id + "/void", {
+    headers: { "Authorization": "Bearer " + get(t, "token", "") }, body: "", timeout: 30000 }, false);
+  // 结果不关心（库状态为准），避免误报
+}
+
+// 退款：amount=null 表示全额（不传 amount 字段，对齐 facade.py）；
+// 传整数分表示部分退款。稳定 PayPal-Request-Id 让同金额重试命中幂等，
+// 成功时把 PayPal 返回的退款 id/status 填进 _state 供 app.lume 记账。
+export func refund_capture(capture_id, amount, currency, note, request_key) {
+  let t = access_token();
+  if (not get(t, "ok", false)) {
+    return pp_network_err("退款凭据/网络不可用", get(t, "err", ""), 503);
+  }
+  let body = {};
+  let has_amt = amount != null and int(amount) > 0;
+  if (has_amt) {
+    put(body, "amount", { value: money2(int(amount)), currency_code: currency });
+  }
+  if (len(note) > 0) { put(body, "note_to_payer", note); }
+
+  let key = request_key;
+  if (len(key) == 0) {
+    key = "refund-" + capture_id + "-" + (has_amt ? string(int(amount)) : "full") + "-" + currency;
+  }
+  let r = request("POST", base_url() + "/v2/payments/captures/" + capture_id + "/refund", {
+    headers: {
+      "Authorization": "Bearer " + get(t, "token", ""),
+      "Content-Type": "application/json",
+      "PayPal-Request-Id": key
+    },
+    body: stringify(body), timeout: 30000
+  }, false);
+  if (len(get(r, "err", "")) > 0) {
+    return pp_network_err("退款网络错误", get(r, "err", ""), 502);
+  }
+  let st = get(r, "status", 0);
+  if (st != 200 and st != 201) {
+    return pp_network_err("退款失败 HTTP " + string(st), substr(get(r, "body", ""), 0, 300), 502);
+  }
+  let j = try(() => json(get(r, "body", "")));
+  let d = get(j, "ok", {});
+  _state.refund_id = get(d, "id", "");
+  _state.refund_status = get(d, "status", "");
+  return null;
+}

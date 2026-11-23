@@ -1,0 +1,38 @@
+// scripts/create-user.lume —— 建用户 / 重置口令
+//
+//   bin/lume scripts/create-user.lume <username> <password> [role]
+//   bin/lume scripts/create-user.lume <username> "" [role]     # 口令取自 .secrets.json 的 admin_password
+//
+// 为什么口令从 argv / 配置文件来：env("...PASSWORD") 一定读不到（lume 的凭据掩码），
+// 见 lib/config.lume 顶部说明。
+import "../lib/db.lume" as db;
+import "../lib/auth.lume" as auth;
+import "../lib/config.lume" as cfg;
+import "../lib/support.lume" as s;
+
+let a = argv();
+let username = lower(s.str_or(get(a, 0, ""), ""));
+let password = s.str_or(get(a, 1, ""), "");
+let role = s.str_or(get(a, 2, "admin"), "admin");
+
+if (len(username) == 0) { username = lower(s.str_or(cfg.value("admin_username", "admin"), "admin")); }
+if (len(password) == 0) { password = s.str_or(cfg.value("admin_password", ""), ""); }
+
+if (len(username) < 3) {
+  print("拒绝：用户名为空或过短（>=3 位，[a-z0-9_-]）");
+} else {
+  if (len(password) < 8) {
+    print("拒绝：口令少于 8 位");
+  } else {
+    let existing = db.row("SELECT id FROM users WHERE username = ?", [username]);
+    if (existing == null) {
+      let affected = auth.create_user(username, password, role);
+      print("created: " + username + " (" + role + ") affected=" + string(affected));
+    } else {
+      let hash = auth.hash_password(password, username);
+      let affected = db.exec("UPDATE users SET password_hash = ?, role = ? WHERE username = ?",
+                             [hash, role, username]);
+      print("password reset: " + username + " affected=" + string(affected));
+    }
+  }
+}

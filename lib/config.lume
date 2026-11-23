@@ -1,0 +1,59 @@
+// lib/config.lume —— 秘密与运行期配置
+//
+// 为什么不是环境变量：lume 的 env() 对名字里含 API_KEY / SECRET / PASSWORD /
+// PASSWD / TOKEN / CREDENTIAL 的变量统一返回 null（凭据掩码，三个后端行为一致：
+// lume-core/src/bridge_native.c:243 与 lang/builtins_fs.c:95）。
+// 所以 SECRET_KEY 这类名字从设计上就读不到 —— 敏感配置一律走文件，
+// 非敏感运行参数（CURRENCY、PORT 等）继续用环境变量。
+//
+// 文件格式：JSON，默认路径 ./.secrets.json（CONF_FILE 可覆盖）：
+//   {
+//     "secret_key": "…",
+//     "admin_username": "admin",
+//     "admin_password": "…",
+//     "paypal_client_id": "…",
+//     "paypal_client_secret": "…",
+//     "paypal_mode": "sandbox"
+//   }
+// 注：本项目无 docs log 路由，已移除从 fastapi-web 复制来的 doc_log_api_key 残留。
+
+import "support.lume" as s;
+
+let cache = {};
+let loaded = false;
+
+export func path() {
+  return s.env_or("CONF_FILE", "./.secrets.json");
+}
+
+export func all() {
+  if (loaded) { return cache; }
+  loaded = true;
+  let raw = try(() => read_file(path()));
+  if (get(raw, "ok", null) != null) {
+    let j = try(() => json(get(raw, "ok", "")));
+    let v = get(j, "ok", null);
+    if (v != null) { cache = v; }
+  }
+  return cache;
+}
+
+export func value(key, dflt) {
+  let v = get(all(), key, null);
+  if (v == null) { return dflt; }
+  return v;
+}
+
+export func present(key) {
+  return get(all(), key, null) != null;
+}
+
+// 生产模式必须配齐的键（返回缺失清单，供启动时快速失败）。
+// PayPal 凭据由 app.lume 启动自检单独校验（生产缺失直接拒绝启动）。
+export func missing_production_keys() {
+  let missing = [];
+  for (k in ["secret_key"]) {
+    if (not present(k)) { push(missing, k); }
+  }
+  return missing;
+}

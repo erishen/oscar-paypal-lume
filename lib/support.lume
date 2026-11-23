@@ -1,0 +1,803 @@
+// support.lume —— 响应封装 / 请求解析 / 边界防护
+//
+// 这里集中三件事，避免每个 handler 重复写：
+//   1. 统一 JSON 响应 + 固定安全头（对应 fastapi-web 的 security_headers.py）
+//   2. body / cookie / query 的解析（DSL 侧没有框架中间件，靠每个 handler 顶部 guard()）
+//   3. guard(req)：IP 过滤 + 路径防护（对应 ip_filter.py / path_protection.py）
+
+// ---------- 环境 ----------
+
+export func env_or(name, dflt) {
+  let v = env(name);
+  if (v == null) { return dflt; }
+  if (len(v) == 0) { return dflt; }
+  return v;
+}
+
+// ---------- 响应 ----------
+
+func sec_headers() {
+  let h = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), " +
+                          "magnetometer=(), gyroscope=(), accelerometer=(), ambient-light-sensor=(), " +
+                          "autoplay=(self), encrypted-media=(self), fullscreen=(self)"
+  };
+  // 原项目只在 production 下发 HSTS（development 走 https 反而会锁死本地调试）
+  if (env_or("APP_ENV", "development") == "production") {
+    put(h, "Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload");
+  }
+  return h;
+}
+
+// 合并安全头与调用方自定义头（后者覆盖前者，框架会抑制同名默认头）
+// 本请求的限流头（guard() 里算完放在这里，json_res 合并时带出）
+// 注意：DSL 每个请求一个新 VM，这里是请求内状态，不是进程全局。
+// 用 map 做请求内状态容器：lume 的全局变量不能从 null 改成 map（类型固定）
+let ST = { rl: {} };
+
+export func merge_headers(extra) {
+  let h = sec_headers();
+  let rlh = get(ST, "rl", {});
+  for (k in keys(rlh)) {
+    put(h, k, get(rlh, k, ""));
+  }
+  if (extra == null) { return h; }
+  for (k in keys(extra)) {
+    put(h, k, get(extra, k, ""));
+  }
+  return h;
+}
+
+export func json_res(status, payload, extra_headers) {
+  return {
+    status: status,
+    type: "application/json",
+    body: stringify(payload),
+    headers: merge_headers(extra_headers)
+  };
+}
+
+export func ok(payload)        { return json_res(200, payload, null); }
+export func created(payload)   { return json_res(201, payload, null); }
+export func no_content(msg)    { return json_res(200, { message: msg }, null); }
+
+// 错误体对齐 fastapi-web 的 exceptions.py：
+//   {"error": true, "message": "...", "status_code": <int>}
+// 仅显式 APP_ENV=development 才把具体原因给客户端；其他值（production / 未配置 /
+// 配错）一律 fail-closed：422 统一「请求参数验证失败」，其余统一「请求失败」。
+// 原项目在 development 下由 exceptions.py 追加 path（422 另有 details）；生产一律 fail-closed。
+// details 的 pydantic v2 精确结构尚未逐字段复刻，这里只补 path，details 仍是已知差异。
+func error_payload(status, message) {
+  let m = message;
+  if (env_or("APP_ENV", "development") != "development") {
+    m = "请求失败";
+  }
+  // 422 对应 RequestValidationError，原项目无论环境都用统一文案
+  if (status == 422) { m = "请求参数验证失败"; }
+  let body = { error: true, message: m, status_code: status };
+  if (env_or("APP_ENV", "development") == "development") {
+    put(body, "path", get(ST, "path", ""));
+  }
+  return body;
+}
+
+export func err(status, message) {
+  return json_res(status, error_payload(status, message), null);
+}
+
+export func err_headers(status, message, extra) {
+  return json_res(status, error_payload(status, message), extra);
+}
+
+// ---------- 请求解析 ----------
+
+// 返回 map；body 为空时返回 {}；JSON 非法返回 null
+export func parse_body(req) {
+  let raw = req.body;
+  if (raw == null) { return {}; }
+  if (len(raw) == 0) { return {}; }
+  let r = try(() => json(raw));
+  if (get(r, "err", null) != null) { return null; }
+  let v = get(r, "ok", null);
+  if (v == null) { return {}; }
+  return v;
+}
+
+export func q_get(req, name, dflt) {
+  return get(req.query_params, name, dflt);
+}
+
+export func q_int(req, name, dflt) {
+  let raw = get(req.query_params, name, null);
+  if (raw == null or len(raw) == 0) { return dflt; }
+  let r = try(() => int(raw));
+  if (get(r, "err", null) != null) { return dflt; }
+  return get(r, "ok", dflt);
+}
+
+// 严格版查询参数：与 FastAPI 的 Query(ge/le) 一样，越界/非数字 → ok=false（调用方回 422），
+// 不做静默钳制。返回 {ok,val}。
+// 严格整数解析：lume 的 int("abc") 走 atoi 语义（"abc"→0、"12abc"→12），
+// 直接拿来校验查询参数会把非法输入静默当成 0。这里先按字符白名单判定，
+// 只接受可选正负号 + 纯数字，再交给 int()。
+export func strict_int(raw) {
+  let t = trim(raw);
+  if (len(t) == 0) { return { ok: false, val: 0 }; }
+  let i = 0;
+  if (substr(t, 0, 1) == "-" or substr(t, 0, 1) == "+") { i = 1; }
+  if (i >= len(t)) { return { ok: false, val: 0 }; }
+  while (i < len(t)) {
+    if (not contains("0123456789", substr(t, i, 1))) { return { ok: false, val: 0 }; }
+    i = i + 1;
+  }
+  let r = try(() => int(t));
+  if (get(r, "err", null) != null) { return { ok: false, val: 0 }; }
+  return { ok: true, val: get(r, "ok", 0) };
+}
+
+export func q_range(req, name, dflt, minv, maxv) {
+  let raw = get(req.query_params, name, null);
+  if (raw == null or len(trim(raw)) == 0) { return { ok: true, val: dflt }; }
+  let t = strict_int(raw);
+  if (not get(t, "ok", false)) { return { ok: false, val: dflt }; }
+  let v = get(t, "val", dflt);
+  if (v < minv or v > maxv) { return { ok: false, val: v }; }
+  return { ok: true, val: v };
+}
+
+// 时间线格式：原项目 pydantic datetime → "YYYY-MM-DDTHH:MM:SS"（UTC，无时区后缀）。
+// 这里按秒做纯算术换算，不依赖进程 TZ（本地闸门常是 Asia/Shanghai，strftime 会偏 8 小时）。
+export func pad2(n) {
+  if (n < 10) { return "0" + string(n); }
+  return string(n);
+}
+
+export func iso_utc(ts) {
+  let parsed = try(() => int(ts));
+  if (get(parsed, "err", null) != null) { return null; }
+  let t = get(parsed, "ok", 0);
+  if (t <= 0) { return null; }
+  let days = int(t / 86400);
+  let rem = t - days * 86400;
+  let hh = int(rem / 3600);
+  let mm = int((rem - hh * 3600) / 60);
+  let ss = rem - hh * 3600 - mm * 60;
+  // Howard Hinnant civil_from_days：把「自 1970-01-01 起的天数」还原成 Y/M/D
+  let z = days + 719468;
+  let era = int(z / 146097);
+  let doe = z - era * 146097;
+  let yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365);
+  let y = yoe + era * 400;
+  let doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100));
+  let mp = int((5 * doy + 2) / 153);
+  let d = doy - int((153 * mp + 2) / 5) + 1;
+  let m = mp + 3;
+  if (mp >= 10) { m = mp - 9; }
+  if (m <= 2) { y = y + 1; }
+  // 带上 Z 后缀：无时区的 ISO 串会被 JS new Date() 当成本地时间解析，
+  // 实际是 UTC —— 前端会整体偏移（东八区显示成 8 小时前）。
+  return string(y) + "-" + pad2(m) + "-" + pad2(d) + "T" + pad2(hh) + ":" + pad2(mm) + ":" + pad2(ss) + "Z";
+}
+
+export func iso_or_null(v) {
+  if (v == null) { return null; }
+  return iso_utc(v);
+}
+
+// 反向：civil → 自 1970-01-01 起的天数（Howard Hinnant，与 iso_utc 互逆）。
+// 仅处理公历非负年份（>=1970），负数年份在演示里不需要。
+func days_from_civil(y, m, d) {
+  let yy = y;
+  if (m <= 2) { yy = y - 1; }
+  let era = int(yy / 400);
+  let yoe = yy - era * 400;
+  let mp = m + 9;
+  if (m > 2) { mp = m - 3; }
+  let doy = int((153 * mp + 2) / 5) + d - 1;
+  let doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy;
+  return era * 146097 + doe - 719468;
+}
+
+// 解析「YYYY-MM-DD[THH:MM:SS]」（视为 UTC）或纯十进制 epoch 秒 → epoch 秒。
+// 返回 null 表示不可解析；调用方拿 null 视为「未过滤」。
+export func parse_epoch(v) {
+  if (v == null) { return null; }
+  let raw = trim(v);
+  if (len(raw) == 0) { return null; }
+  // 纯 epoch 秒（严格十进制）
+  let t = strict_int(raw);
+  if (get(t, "ok", false) and get(t, "val", 0) > 0) { return get(t, "val", 0); }
+  // ISO 日期（至少 YYYY-MM-DD）
+  if (len(raw) >= 10) {
+    let yy = strict_int(substr(raw, 0, 4));
+    let mm = strict_int(substr(raw, 5, 2));
+    let dd = strict_int(substr(raw, 8, 2));
+    if (get(yy, "ok", false) and get(mm, "ok", false) and get(dd, "ok", false)) {
+      let y = get(yy, "val", 0);
+      let m = get(mm, "val", 0);
+      let d = get(dd, "val", 0);
+      if (y >= 1970 and m >= 1 and m <= 12 and d >= 1 and d <= days_in_month(y, m)) {
+        return days_from_civil(y, m, d) * 86400;
+      }
+    }
+  }
+  return null;
+}
+
+// 公历某月天数（含闰年）；仅用于日期合法性校验。
+func days_in_month(y, m) {
+  let dim = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  let n = get(dim, m - 1, 31);
+  if (m == 2 and ((y % 4 == 0 and y % 100 != 0) or y % 400 == 0)) { n = 29; }
+  return n;
+}
+
+// ---------- 表单（application/x-www-form-urlencoded）----------
+// DSL 没有 url-decode：自己按 %XX（ASCII 0x20..0x7E）+ "+"→空格 解。
+// 非 ASCII 的 %XX 保留原字面量（登录字段是账号口令，实际都是 ASCII）。
+let FRM_HEX = {"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,
+               "a":10,"b":11,"c":12,"d":13,"e":14,"f":15};
+let FRM_PRINT = " " + "!" + "\"" + "#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+
+export func pct_decode(v) {
+  let out = "";
+  let i = 0;
+  while (i < len(v)) {
+    let ch = substr(v, i, 1);
+    if (ch == "+") {
+      out = out + " ";
+      i = i + 1;
+    } else {
+      if (ch == "%" and i + 2 < len(v)) {
+        let h1 = get(FRM_HEX, lower(substr(v, i + 1, 1)), -1);
+        let h2 = get(FRM_HEX, lower(substr(v, i + 2, 1)), -1);
+        if (h1 >= 0 and h2 >= 0) {
+          let code = h1 * 16 + h2;
+          if (code >= 32 and code <= 126) { out = out + substr(FRM_PRINT, code - 32, 1); }
+          i = i + 3;
+        } else {
+          out = out + ch;
+          i = i + 1;
+        }
+      } else {
+        out = out + ch;
+        i = i + 1;
+      }
+    }
+  }
+  return out;
+}
+
+// "username=admin&password=a%40b" → {username:"admin", password:"a@b"}
+export func parse_form(req) {
+  let m = {};
+  let raw = req.body;
+  if (raw == null or len(raw) == 0) { return m; }
+  for (pair in split(raw, "&")) {
+    if (len(pair) == 0) { continue; }
+    let eq = -1;
+    let j = 0;
+    while (j < len(pair)) {
+      if (substr(pair, j, 1) == "=") { eq = j; break; }
+      j = j + 1;
+    }
+    if (eq <= 0) { continue; }
+    let k = pct_decode(substr(pair, 0, eq));
+    let v = pct_decode(substr(pair, eq + 1, len(pair) - eq - 1));
+    if (len(k) > 0) { put(m, k, v); }
+  }
+  return m;
+}
+
+// Cookie: "a=1; b=2" → 取 name 的值；没有则 null
+// 会话令牌用 "." 分段且不含 "="，所以按 "=" 切两段即可
+export func cookie_get(req, name) {
+  let raw = req.cookie;
+  if (raw == null) { return null; }
+  for (part in split(raw, ";")) {
+    let p = trim(part);
+    let kv = split(p, "=");
+    if (len(kv) == 2) {
+      if (trim(get(kv, 0, "")) == name) { return trim(get(kv, 1, "")); }
+    }
+  }
+  return null;
+}
+
+// ---------- 边界防护 ----------
+
+// 逗号分隔的 IP 列表；支持精确匹配与 "10.0.*" 前缀匹配
+// （CGNAT/微信出口这类整段放行的场景用前缀，CIDR 不在 DSL 里解析）
+// IPv4 拆八位组；非法返回 null
+func ipv4_octets(s) {
+  let parts = split(s, ".");
+  if (len(parts) != 4) { return null; }
+  let out = [];
+  for (part in parts) {
+    if (len(part) == 0 or len(part) > 3) { return null; }
+    let n = strict_int(part);
+    if (not get(n, "ok", false)) { return null; }
+    let v = get(n, "val", 0);
+    if (v < 0 or v > 255) { return null; }
+    push(out, v);
+  }
+  return out;
+}
+
+// 原项目用 ipaddress.ip_network(x, strict=False) 做匹配，支持 a.b.c.d/len 与裸 IP；
+// 这里对 IPv4 按位比较八位组。IPv6 不在契约内。
+func ipv4_cidr_match(ip, cidr) {
+  let parts = split(cidr, "/");
+  if (len(parts) != 2) { return false; }
+  let a = ipv4_octets(ip);
+  let b = ipv4_octets(trim(parts[0]));
+  if (a == null or b == null) { return false; }
+  let br = strict_int(trim(parts[1]));
+  if (not get(br, "ok", false)) { return false; }
+  let bits = get(br, "val", 0);
+  if (bits < 0 or bits > 32) { return false; }
+  let i = 0;
+  while (i < 4) {
+    let need = bits - i * 8;
+    if (need >= 8) {
+      if (a[i] != b[i]) { return false; }
+    } else {
+      if (need > 0) {
+        // 取该八位组的高 need 位比较：两边同时整除 2^(8-need)
+        let div = 1;
+        let q = 0;
+        while (q < (8 - need)) { div = div * 2; q = q + 1; }
+        if ((a[i] / div) != (b[i] / div)) { return false; }
+      }
+      return true;
+    }
+    i = i + 1;
+  }
+  return true;
+}
+
+export func ip_in_list(ip, list_str) {
+  if (list_str == null or len(list_str) == 0) { return false; }
+  for (entry in split(list_str, ",")) {
+    let e = trim(entry);
+    if (len(e) == 0) { continue; }
+    if (contains(e, "/")) {
+      if (ipv4_cidr_match(ip, e)) { return true; }
+    } else {
+      if (len(e) > 0 and substr(e, len(e) - 1, 1) == "*") {
+        let prefix = substr(e, 0, len(e) - 1);
+        if (substr(ip, 0, len(prefix)) == prefix) { return true; }
+      } else {
+        if (ip == e) { return true; }
+      }
+    }
+  }
+  return false;
+}
+
+// 取真实客户端 IP：优先 X-Forwarded-For 第一段（与 fastapi-web 的 get_client_ip 一致）
+export func client_ip(req) {
+  let xff = req.x_forwarded_for;
+  if (xff != null and len(xff) > 0) {
+    return trim(get(split(xff, ","), 0, req.remote_addr));
+  }
+  let ra = req.remote_addr;
+  if (ra == null or len(ra) == 0) { return "unknown"; }
+  return ra;
+}
+
+export func has_traversal(path) {
+  let p = lower(path);
+  if (contains(p, "..")) { return true; }
+  if (contains(p, "%2e%2e")) { return true; }
+  if (contains(p, "%00")) { return true; }
+  return false;
+}
+
+func ends_with(s, suf) {
+  if (len(s) < len(suf)) { return false; }
+  return substr(s, len(s) - len(suf), len(suf)) == suf;
+}
+
+func starts_with(s, pre) {
+  if (len(s) < len(pre)) { return false; }
+  return substr(s, 0, len(pre)) == pre;
+}
+
+// 对应 path_protection.py 的 SENSITIVE_PATTERNS（30+ 条，统一小写后缀匹配）
+func sensitive_path(path) {
+  let p = lower(path);
+  // 原项目全部是 re.search（任意位置命中）；其中 .bak/.old/... 带 `$` 锚定结尾
+  let anchored = [".bak", ".backup", ".old", ".tmp", ".swp", ".swo", ".log",
+    ".sql", ".key", ".pem", ".crt", ".p12", ".keystore", ".jks", ".wallet",
+    ".db", ".mdb", ".config", ".secret", ".credentials", ".prod", ".dev", ".local", ".staging"];
+  for (r in anchored) {
+    if (ends_with(p, r)) { return true; }
+  }
+  let anywhere = [".env", ".git", ".hg", ".svn", ".idea", ".vscode",
+    ".dockerignore", ".gitignore", ".ds_store", "thumbs.db", ".sqlite",
+    ".password", ".auth", ".token", "sendgrid.env"];
+  for (r in anywhere) {
+    if (contains(p, r)) { return true; }
+  }
+  return false;
+}
+
+// 原项目 CRAWLER_SUSPICIOUS_PATTERNS：默认只记录放行，PATH_PROTECTION_STRICT=true 时 404
+func suspicious_path(path) {
+  let p = lower(path);
+  if (p == "/login") { return true; }
+  let rules = ["/admin", "/wp-", "/wordpress", "/phpmyadmin", "/mysql", "/backup",
+    "/setup", "/install", "/test", "/debug", "/dns-query", "/actuator", "/api-docs",
+    "/v1/models", "/v1/completions", "/v1/chat", "/api/v1", "/graphql", "/favicon.ico"];
+  for (r in rules) {
+    if (contains(p, r)) { return true; }
+  }
+  return false;
+}
+
+// 合法 API 路径白名单：/auth/login 会被 /login 规则命中，必须放行
+func legit_path(path) {
+  let p = lower(path);
+  let legit = ["/auth/login", "/auth/logout", "/auth/me", "/auth/token-from-nextauth"];
+  for (x in legit) { if (p == x) { return true; } }
+  return false;
+}
+
+func strict_protection() {
+  return lower(env_or("PATH_PROTECTION_STRICT", "false")) == "true";
+}
+
+func suspicious_blocked() {
+  return {
+    status: 404,
+    type: "application/json",
+    body: "{\"error\":true,\"message\":\"Not Found\",\"code\":\"SUSPICIOUS_PATH\"}",
+    headers: merge_headers(null)
+  };
+}
+
+func path_blocked() {
+  return {
+    status: 404,
+    type: "application/json",
+    body: "{\"error\":true,\"message\":\"Not Found\",\"code\":\"PATH_BLOCKED\"}",
+    headers: merge_headers(null)
+  };
+}
+
+func ip_blocked(status) {
+  return {
+    status: status,
+    type: "application/json",
+    body: "{\"error\":true,\"message\":\"访问被拒绝\",\"code\":\"IP_BLOCKED\"}",
+    headers: merge_headers(null)
+  };
+}
+
+func rl_dsn() { return env_or("LUME_DB", "./.data/app.db"); }
+
+// 一次计数：返回 {limit, remaining, over}；存储不可用时 fail-open（与 Redis 出错同口径）
+// 导出供 app.lume 做 per-target（如 per-email）节流。
+export func rate_take(key, limit, window) {
+  let t = now();
+  let cur = 0;
+  let ws = 0;
+  let rowh = null;
+  let q = try(() => sql_query(rl_dsn(),
+    "SELECT window_start, count FROM rate_limits WHERE key = ?", [key]));
+  if (get(q, "err", null) == null) {
+    let rows = get(q, "ok", null);
+    if (rows != null and len(rows) > 0) {
+      rowh = get(rows, 0, null);
+    }
+  }
+  if (rowh != null) {
+    ws = int(get(rowh, "window_start", 0));
+    cur = int(get(rowh, "count", 0));
+  }
+  if (ws == 0 or t - ws >= window) {
+    let w1 = try(() => sql_write(rl_dsn(),
+      "INSERT OR REPLACE INTO rate_limits (key, window_start, count) VALUES (?,?,?)", [key, t, 1]));
+    if (get(w1, "err", null) != null) { return { limit: limit, remaining: limit - 1, over: false, soft: true }; }
+    return { limit: limit, remaining: limit - 1, over: false, soft: false };
+  }
+  if (cur >= limit) {
+    return { limit: limit, remaining: 0, over: true, soft: false };
+  }
+  let w2 = try(() => sql_write(rl_dsn(),
+    "UPDATE rate_limits SET count = ? WHERE key = ?", [cur + 1, key]));
+  if (get(w2, "err", null) != null) { return { limit: limit, remaining: limit - cur - 1, over: false, soft: true }; }
+  return { limit: limit, remaining: limit - cur - 1, over: false, soft: false };
+}
+
+// ---- 按用户名的登录失败锁定（爆破防护，独立于 per-IP 限流）----
+// 攻击者轮换 IP 可绕过 per-IP 限流，但无法绕过按用户名的失败累计。
+// 阈值内连续失败（RATE_LIMIT_LOGIN_FAILS，默认 10 / RATE_LIMIT_LOGIN_FAIL_WINDOW 默认 900s）→ 429。
+// 成功登录清除计数。存储不可用时 fail-open（不阻断合法用户，仅失去保护）。
+func auth_fail_limit() { return int(env_or("RATE_LIMIT_LOGIN_FAILS", "10")); }
+func auth_fail_window() { return int(env_or("RATE_LIMIT_LOGIN_FAIL_WINDOW", "900")); }
+func auth_fail_key(username) { return "authfail|" + username; }
+
+// 失败计数：返回 {locked, count, limit, window}
+export func auth_fail_hit(username) {
+  let dsn = rl_dsn();
+  let key = auth_fail_key(username);
+  let lim = auth_fail_limit();
+  let win = auth_fail_window();
+  let t = now();
+  let cur = 0;
+  let ws = 0;
+  let q = try(() => sql_query(dsn, "SELECT window_start, count FROM rate_limits WHERE key = ?", [key]));
+  if (get(q, "err", null) == null) {
+    let rows = get(q, "ok", null);
+    if (rows != null and len(rows) > 0) { ws = int(get(get(rows, 0, {}), "window_start", 0)); cur = int(get(get(rows, 0, {}), "count", 0)); }
+  }
+  if (ws == 0 or t - ws >= win) {
+    let w1 = try(() => sql_write(dsn, "INSERT OR REPLACE INTO rate_limits (key, window_start, count) VALUES (?,?,?)", [key, t, 1]));
+    if (get(w1, "err", null) != null) { return { locked: false, count: 1, limit: lim, window: win, soft: true }; }
+    return { locked: false, count: 1, limit: lim, window: win };
+  }
+  if (cur >= lim) { return { locked: true, count: cur, limit: lim, window: win }; }
+  let nc = cur + 1;
+  let w2 = try(() => sql_write(dsn, "UPDATE rate_limits SET count = ? WHERE key = ?", [nc, key]));
+  if (get(w2, "err", null) != null) { return { locked: false, count: nc, limit: lim, window: win, soft: true }; }
+  return { locked: (nc >= lim), count: nc, limit: lim, window: win };
+}
+
+// 成功登录：清除失败计数
+export func auth_fail_reset(username) {
+  let dsn = rl_dsn();
+  try(() => sql_write(dsn, "DELETE FROM rate_limits WHERE key = ?", [auth_fail_key(username)]));
+  return;
+}
+
+// 预检：当前是否已锁定（不递增计数；窗口过期自动视为未锁）
+export func auth_fail_locked(username) {
+  let dsn = rl_dsn();
+  let q = try(() => sql_query(dsn, "SELECT count FROM rate_limits WHERE key = ? AND window_start >= ?",
+                              [auth_fail_key(username), now() - auth_fail_window()]));
+  if (get(q, "err", null) == null) {
+    let rows = get(q, "ok", null);
+    if (rows != null and len(rows) > 0) {
+      return int(get(get(rows, 0, {}), "count", 0), 0) >= auth_fail_limit();
+    }
+  }
+  return false;
+}
+
+func rate_limit_of(req) {
+  let p = req.path;
+  if (contains(p, "/auth/login")) {
+    return { limit: int(env_or("RATE_LIMIT_LOGIN_REQUESTS", "30")), window: int(env_or("RATE_LIMIT_LOGIN_WINDOW", "60")) };
+  }
+  // 注册：per-IP 防批量建号（默认 10/小时）
+  if (p == "/auth/register") {
+    return { limit: int(env_or("RATE_LIMIT_REGISTER_REQUESTS", "10")), window: int(env_or("RATE_LIMIT_REGISTER_WINDOW", "3600")) };
+  }
+  // 找回口令请求：per-IP 防邮件轰炸（默认 5/15 分钟）
+  if (p == "/auth/password-reset/request") {
+    return { limit: int(env_or("RATE_LIMIT_RESET_REQUESTS", "5")), window: int(env_or("RATE_LIMIT_RESET_WINDOW", "900")) };
+  }
+  if (p == "/api/docs/log" and lower(str_or(req.method, "GET")) == "post") {
+    return { limit: int(env_or("RATE_LIMIT_STRICT_REQUESTS", "20")), window: int(env_or("RATE_LIMIT_STRICT_WINDOW", "60")) };
+  }
+  return { limit: int(env_or("RATE_LIMIT_REQUESTS", "100")), window: int(env_or("RATE_LIMIT_WINDOW", "60")) };
+}
+
+func rl_exempt(path) {
+  if (path == "/health" or path == "/ping" or path == "/api/docs" or path == "/redoc") { return true; }
+  return false;
+}
+
+func over_limit(limit, window) {
+  put(ST, "rl", {
+    "X-RateLimit-Limit": string(limit),
+    "X-RateLimit-Remaining": "0",
+    "X-RateLimit-Reset": string(window),
+    "Retry-After": string(window)
+  });
+  return {
+    status: 429,
+    type: "application/json",
+    body: stringify({ error: true, message: "请求过于频繁，请稍后再试", limit: limit, window: window }),
+    headers: merge_headers(null)
+  };
+}
+
+// 返回 null = 放行；返回响应 map = 直接返回给客户端
+// 注意：这是 per-handler 约定，每个 handler 第一行都要调 —— 漏一次就是洞
+// 去掉 query，原项目 request.url.path 不含 `?`；限流 key、敏感路径匹配、
+// 错误体 path 都必须用纯路径，否则 `?x=1` 可以换桶绕过限流。
+export func path_only(p) {
+  let i = 0;
+  while (i < len(p)) {
+    if (substr(p, i, 1) == "?") { return substr(p, 0, i); }
+    i = i + 1;
+  }
+  return p;
+}
+
+// 访问统计：每请求记录一次（guard 放行前调用）。API 服务的最小实现：
+// 只记 path/method/ip/ua/referrer/时间；排除健康/文档/静态/OpenAPI 与
+// OPTIONS/HEAD。写入失败不阻塞请求（统计是尽力而为，不影响业务）。
+// ua/referrer 截断 200 字符，避免把超长爬虫串/第三方 URL 原样入库。
+// 自己/运维 IP 前置丢弃（与 nsbp-lume 一致）：命中 FASTAPI_WEB_VISIT_EXCLUDE_IPS
+// （精确 IP 或 CIDR，逗号分隔）则不落盘、不计数，对访客统计完全不可见。
+func visit_excluded_ip(ip) {
+  if (ip == null or ip == "") { return false; }
+  let raw = env_or("FASTAPI_WEB_VISIT_EXCLUDE_IPS", "");
+  if (raw == null or raw == "") { return false; }
+  let parts = split(replace(str(raw), " ", ""), ",");
+  for (let e in parts) {
+    let rule = str(e);
+    if (rule == "" or rule == "null") { continue; }
+    let rs = rule;
+    let bits = 32;
+    let sp = split(rule, "/");
+    if (len(sp) == 2) {
+      bits = int(str(get(sp, 1, "32")));
+      rs = str(get(sp, 0, ""));
+    }
+    if (bits >= 32) {
+      if (ip == rs) { return true; }
+    } else {
+      let want = bits / 8;
+      if (want < 1) { continue; }
+      let io = split(ip, ".");
+      let ro = split(rs, ".");
+      if (len(io) != 4 or len(ro) < want) { continue; }
+      let ok = true;
+      for (let i in range(want)) {
+        if (io[i] != ro[i]) { ok = false; break; }
+      }
+      if (ok) { return true; }
+    }
+  }
+  return false;
+}
+
+export func record_visit(req, path, ip) {
+  let method = str_or(req.method, "GET");
+  if (method == "OPTIONS" or method == "HEAD") { return; }
+  // 自己/运维 IP 前置丢弃（不落盘、不计数），与 nsbp-lume / specpulse-lume 一致。
+  if (visit_excluded_ip(ip)) { return; }
+  let p = lower(path);
+  if (p == "/health" or p == "/health/deep" or p == "/ping") { return; }
+  if (p == "/api/visits") { return; }
+  if (starts_with(p, "/docs") or starts_with(p, "/static") or
+      starts_with(p, "/redoc") or starts_with(p, "/openapi")) { return; }
+  let ua = str_or(req.user_agent, "");
+  if (len(ua) > 200) { ua = substr(ua, 0, 200); }
+  let ref = str_or(get(req, "referer", get(req, "referrer", "")), "");
+  if (len(ref) > 200) { ref = substr(ref, 0, 200); }
+  // 访问统计是尽力而为：写入失败仅静默忽略，绝不阻塞业务请求。
+  let dsn = env_or("LUME_DB", "./.data/app.db");
+  let w = try(() => sql_write(dsn,
+    "INSERT INTO visits (path, method, ip, ua, referrer, created) VALUES (?,?,?,?,?,?)",
+    [path, method, ip, ua, ref, now()]));
+  // 概率清理（约每 500 秒一次）：防 visits / rate_limits 无限膨胀。
+  // visits 只留最近 30 天；rate_limits 只留最近 1 天有活动的窗口（key=path|ip）。
+  if (get(w, "err", null) == null and int(now()) % 500 == 0) {
+    try(() => sql_write(dsn, "DELETE FROM visits WHERE created < ?", [now() - 30 * 86400]));
+    try(() => sql_write(dsn, "DELETE FROM rate_limits WHERE window_start < ?", [now() - 86400]));
+  }
+  return;
+}
+
+export func guard(req) {
+  put(ST, "rl", {});
+  let path = path_only(str_or(req.path, ""));
+  put(ST, "path", path);
+  let ip = client_ip(req);
+  let black = env_or("IP_BLACKLIST", "");
+  let white = env_or("IP_WHITELIST", "");
+  let ip_exempt = (path == "/health" or path == "/ping" or path == "/robots.txt");
+  // 原项目 IPFilterMiddleware 启用名单时给每个响应都带 X-Client-IP（含豁免路径）
+  if (len(black) > 0 or len(white) > 0) {
+    put(ST, "rl", { "X-Client-IP": ip });
+  }
+
+  // 1) 限流最先执行：原项目 RateLimitMiddleware 由 setup_middleware 最后 add_middleware，
+  //    位于 PathProtection / IPFilter 之外，所以敏感路径、可疑路径、IP 拒绝的响应
+  //    也必须计数并带 X-RateLimit-*（否则 /.env 这类扫描可以绕过限流）。
+  if (not rl_exempt(path)) {
+    let conf = rate_limit_of(req);
+    let r = rate_take(path + "|" + ip, get(conf, "limit", 100), get(conf, "window", 60));
+    if (get(r, "over", false)) {
+      return over_limit(get(conf, "limit", 100), get(conf, "window", 60));
+    }
+    let h = {
+      "X-RateLimit-Limit": string(get(conf, "limit", 100)),
+      "X-RateLimit-Remaining": string(get(r, "remaining", 0))
+    };
+    // 原项目 IPFilterMiddleware 在启用名单配置时给每个响应加 X-Client-IP
+    if (len(black) > 0 or len(white) > 0) { put(h, "X-Client-IP", ip); }
+    put(ST, "rl", h);
+  }
+
+  // 2) 敏感路径（原项目 PathProtectionMiddleware 在限流之后、IP 过滤之前）
+  if (sensitive_path(path)) { return path_blocked(); }
+
+  // 2b) 可疑路径（爬虫探测）：默认放行，严格模式下 404；/auth/* 白名单不受影响
+  if (suspicious_path(path) and not legit_path(path)) {
+    if (strict_protection()) { return suspicious_blocked(); }
+  }
+
+  // 3) IP 名单（原项目 IP 过滤对 /health、/ping、/robots.txt 豁免）
+  if (not ip_exempt) {
+    if (ip_in_list(ip, black)) { return ip_blocked(403); }
+    if (len(white) > 0 and not ip_in_list(ip, white)) { return ip_blocked(403); }
+  }
+
+  // 4) 路径穿越：原项目没有单独 400，Starlette 归一化后按未注册路径回统一 404
+  if (has_traversal(path)) { return err(404, "Not Found"); }
+
+  // 5) IP 自动黑名单（5 分钟超过阈值 → 403，对应 ip_filter 的 auto blacklist）
+  if (not rl_exempt(path)) {
+    let ab_win = int(env_or("AUTO_BLACKLIST_WINDOW", "300"));
+    let ab_max = int(env_or("AUTO_BLACKLIST_THRESHOLD", "500"));
+    let ab = rate_take("ip|" + ip, ab_max + 1, ab_win);
+    if (get(ab, "over", false)) { return ip_blocked(403); }
+  }
+
+  // 6) 访问统计：所有放行的真实请求记一条（尽力而为，失败不阻塞）
+  record_visit(req, path, ip);
+
+  return null;
+}
+
+// ---------- 小工具 ----------
+
+export func str_or(v, dflt) {
+  if (v == null) { return dflt; }
+  return v;
+}
+
+export func is_blank(v) {
+  if (v == null) { return true; }
+  if (len(trim(v)) == 0) { return true; }
+  return false;
+}
+
+// 公开接口的手机号 / 邮箱脱敏（对应 fastapi-web 的 mask_phone / mask_email）
+export func mask_phone(v) {
+  if (is_blank(v)) { return v; }
+  let s = trim(v);
+  // 原项目：长度不足 7 直接原样返回（不是整体打码）
+  if (len(s) < 7) { return v; }
+  return substr(s, 0, 3) + "****" + substr(s, len(s) - 4, 4);
+}
+
+export func mask_email(v) {
+  if (is_blank(v)) { return v; }
+  let s = trim(v);
+  let at = -1;
+  let i = 0;
+  while (i < len(s)) {
+    if (substr(s, i, 1) == "@") { at = i; break; }
+    i = i + 1;
+  }
+  // 原项目：非法格式（没有 @）原样返回；本地名 <=1 字符时保留它再加 ***
+  if (at < 0) { return v; }
+  let local = substr(s, 0, at);
+  let domain = substr(s, at, len(s) - at);
+  if (len(local) <= 1) { return local + "***" + domain; }
+  return substr(local, 0, 2) + "***" + domain;
+}
+
+// ---------- 参数读取 ----------
+// 说明：DSL 没有 chr()/url-decode 内置（框架只解 query，不解 body），
+// 所以 application/x-www-form-urlencoded 的 body 不做百分号解码。
+// /auth/login 因此接受 JSON body 或 query 参数；这是与 fastapi-web
+// （OAuth2PasswordRequestForm，表单编码）的唯一请求契约差异。
+
+export func params_of(req) {
+  let b = parse_body(req);
+  if (b != null and len(keys(b)) > 0) { return b; }
+  return req.query_params;
+}

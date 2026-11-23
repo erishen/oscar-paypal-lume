@@ -1,0 +1,181 @@
+// auth.lume —— 认证与会话
+//
+// 与 fastapi-web 的差异（这是设计变更，不是缺口）：
+//   fastapi-web: JWT（python-jose）+ bcrypt（passlib）
+//   本项目:      HMAC 签名的会话 cookie + HMAC-SHA256 迭代 KDF
+//
+// 为什么不用 bcrypt：lume 只有 crypt_verify()（校验），没有生成器；
+// 而 macOS 上 crypt_sha512() 直接不可用（"SHA-512 crypt unavailable"）。
+// 所以口令哈希改为本文件内的 KDF，格式 v1$<iter>$<salt>$<hash>，校验用
+// const_time_eq() 常数时间比较。强度低于 bcrypt，但胜在零依赖、可复现。
+//
+// 会话令牌：<username>.<exp>.<hmac_hex>，无状态（不需要 sessions 表），
+// 退出登录 = 客户端清 cookie。用户名限定为 [a-z0-9_-]，不能含 "."，
+// 否则令牌分段会被用户名污染。
+
+import "support.lume" as s;
+import "config.lume" as cfg;
+import "db.lume" as db;
+
+// cookie 名对齐 fastapi-web 的 security.py（access_token），老客户端直接复用。
+// 读取时兼容历史名 lume_session，避免已登录的本地会话被一次性打掉。
+export let COOKIE_NAME = "access_token";
+export let LEGACY_COOKIE_NAME = "lume_session";
+export let TOKEN_TYPE = "bearer";
+
+// 会话 HMAC 密钥。env("SECRET_KEY") 一定读不到（凭据掩码），只能从 .secrets.json 取。
+export func secret() {
+  let v = cfg.value("secret_key", null);
+  if (v == null) { return "dev-only-change-me"; }
+  return v;
+}
+
+export func secret_is_configured() {
+  return cfg.value("secret_key", null) != null;
+}
+
+export func token_ttl() {
+  // 原项目 ACCESS_TOKEN_EXPIRE_MINUTES 默认 30 → 1800 秒
+  return int(s.env_or("SESSION_TTL_SECONDS", "1800"));
+}
+
+func kdf_iter() {
+  // 600 对离线爆破太弱；默认提高到 12000（旧哈希自带 iter，仍可验证）
+  return int(s.env_or("KDF_ITER", "12000"));
+}
+
+func valid_username(name) {
+  if (name == null) { return false; }
+  let n = trim(name);
+  if (len(n) < 3 or len(n) > 32) { return false; }
+  let allowed = "abcdefghijklmnopqrstuvwxyz0123456789_-";
+  let i = 0;
+  while (i < len(n)) {
+    if (not contains(allowed, lower(substr(n, i, 1)))) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+func salt_for(username) {
+  return substr(hmac_sha256(secret(), "salt:" + username + ":" + string(now())), 0, 32);
+}
+
+// 口令派生：PBKDF2 思路的 HMAC 迭代（不是标准 PBKDF2，但同样的用途）
+func kdf(password, salt, iter) {
+  let acc = hmac_sha256(salt + ":0", password);
+  let i = 1;
+  while (i < iter) {
+    acc = hmac_sha256(salt + ":" + string(i), acc);
+    i = i + 1;
+  }
+  return acc;
+}
+
+export func hash_password(password, username) {
+  let iter = kdf_iter();
+  let salt = salt_for(username);
+  return "v1$" + string(iter) + "$" + salt + "$" + kdf(password, salt, iter);
+}
+
+export func verify_password(stored, password, username) {
+  if (s.is_blank(stored)) { return false; }
+  let parts = split(stored, "$");
+  if (len(parts) != 4) { return false; }
+  if (get(parts, 0, "") != "v1") { return false; }
+  let iter = int(get(parts, 1, "0"));
+  if (iter < 100) { return false; }
+  let salt = get(parts, 2, "");
+  let expect = get(parts, 3, "");
+  let got = kdf(password, salt, iter);
+  return const_time_eq(expect, got);
+}
+
+// ---------- 会话令牌 ----------
+
+export func issue_token(username) {
+  let exp = now() + token_ttl();
+  let payload = username + "." + string(exp);
+  let sig = hmac_sha256(secret(), payload);
+  return payload + "." + sig;
+}
+
+// 返回 {user, exp}；无效/过期返回 null
+export func read_token(token) {
+  if (s.is_blank(token)) { return null; }
+  let parts = split(token, ".");
+  if (len(parts) != 3) { return null; }
+  let user = get(parts, 0, "");
+  let exp_raw = get(parts, 1, "");
+  let sig = get(parts, 2, "");
+  if (not valid_username(user)) { return null; }
+  let exp = int(exp_raw);
+  let expect = hmac_sha256(secret(), user + "." + exp_raw);
+  if (not const_time_eq(sig, expect)) { return null; }
+  if (exp < now()) { return null; }
+  return { user: user, exp: exp };
+}
+
+// ---------- 用户 ----------
+
+export func user_by_name(username) {
+  return db.row("SELECT id, username, password_hash, role FROM users WHERE username = ?", [username]);
+}
+
+export func create_user(username, password, role) {
+  let hash = hash_password(password, username);
+  return db.exec("INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+                 [username, hash, role, string(now())]);
+}
+
+// 从 cookie 或 Authorization: Bearer 取会话，返回 {user, role} 或 null
+export func session(req) {
+  let token = s.cookie_get(req, COOKIE_NAME);
+  if (s.is_blank(token)) { token = s.cookie_get(req, LEGACY_COOKIE_NAME); }
+  if (s.is_blank(token)) {
+    let authz = req.authorization;
+    if (authz != null and len(authz) > 7) {
+      if (lower(substr(authz, 0, 7)) == "bearer ") {
+        token = trim(substr(authz, 7, len(authz) - 7));
+      }
+    }
+  }
+  let claim = read_token(token);
+  if (claim == null) { return null; }
+  let u = user_by_name(get(claim, "user", ""));
+  if (u == null) { return null; }
+  return { user: get(u, "username", ""), role: get(u, "role", "viewer") };
+}
+
+// 要求已登录；未登录返回 401 响应，登录返回 null
+export func require_login(req) {
+  let sess = session(req);
+  if (sess == null) { return s.err(401, "无效的认证凭据"); }
+  return null;
+}
+
+// 要求管理员；失败返回响应 map，成功返回 null
+export func require_admin(req) {
+  let sess = session(req);
+  if (sess == null) { return s.err(401, "无效的认证凭据"); }
+  if (get(sess, "role", "viewer") != "admin") {
+    return s.err(403, "需要管理员权限");
+  }
+  return null;
+}
+
+export func current(req) {
+  return session(req);
+}
+
+// Set-Cookie 头（HttpOnly；Secure 由环境变量控制，反代终止 TLS 时打开）
+export func cookie_header(token) {
+  let secure = "";
+  if (s.env_or("COOKIE_SECURE", "0") == "1") { secure = "; Secure"; }
+  // Max-Age 与令牌 TTL 一致（原项目 max_age=expire_minutes*60）
+  return COOKIE_NAME + "=" + token + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=" + string(token_ttl()) + secure;
+}
+
+export func clear_cookie_header() {
+  return COOKIE_NAME + "=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+}

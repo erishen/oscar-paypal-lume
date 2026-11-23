@@ -1,0 +1,50 @@
+// db.lume —— 数据访问层
+//
+// lume 刻意没有 ORM / 迁移工具（CAPABILITIES.md「deliberately not filed」），
+// 所以这里就是裸 SQL + 一个 DSN。与 fastapi-web 的对应关系：
+//   SQLAlchemy session  -> sql_query / sql_write（读只读、写走护栏）
+//   alembic 迁移        -> schema.sql + init.lume（本项目原本也没有 migrations 目录）
+//
+// DSN：
+//   默认 ./.data/app.db（SQLite，可直接跑）
+//   MySQL: LUME_DB="mysql://user:pass@host:3306/db"（需要 host 以 WITH_MYSQL=1 构建）
+
+import "support.lume" as s;
+
+export func dsn() {
+  return s.env_or("LUME_DB", "./.data/app.db");
+}
+
+export func q(sql, params) {
+  return sql_query(dsn(), sql, params);
+}
+
+export func q0(sql) {
+  return sql_query(dsn(), sql);
+}
+
+// 单行结果；没有行返回 null
+export func row(sql, params) {
+  let rows = q(sql, params);
+  if (rows == null) { return null; }
+  if (len(rows) == 0) { return null; }
+  return get(rows, 0, null);
+}
+
+export func exec(sql, params) {
+  return sql_write(dsn(), sql, params);
+}
+
+export func exec0(sql) {
+  return sql_write(dsn(), sql);
+}
+
+// 连接是否可用（/health 用真实探测，不硬编码 healthy）
+export func healthy() {
+  let r = try(() => q0("SELECT 1 AS ok"));
+  if (get(r, "err", null) != null) { return false; }
+  let rows = get(r, "ok", null);
+  if (rows == null) { return false; }
+  if (len(rows) == 0) { return false; }
+  return true;
+}

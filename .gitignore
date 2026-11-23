@@ -1,0 +1,15 @@
+# 凭据 / 数据
+.secrets.json
+.env
+.data/
+logs/
+*.log
+# 前端
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+# 杂项
+.DS_Store
+*.pid
+.docker/ctx/
